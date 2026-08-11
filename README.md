@@ -23,15 +23,32 @@ key, no account. Check what you have:
 python --version
 ```
 
-**Getting the files.** Either clone the repo, or just download the one tool you
-want — each is a single self-contained file:
+**Getting the files — cloning is recommended:**
 
 ```
 git clone https://github.com/bmmcconn/Wolfpack-Admin.git
+cd Wolfpack-Admin
+python class_search.py EM --term "Fall 2026"
 ```
 
-To grab a single file instead, open it above, click **Raw**, and save it. Then run
-it from whatever folder you saved it in.
+Then `git pull` now and again. **This matters more than it usually does** — see
+below.
+
+*No git installed?* Open the file you want, click **Raw**, and save it; each tool
+is one self-contained file and will run from anywhere. Just know that a saved
+copy is frozen at the moment you downloaded it.
+
+### Keeping current
+
+These tools read NC State's public web pages and parse what comes back. **When
+those pages change, a tool breaks** — sometimes loudly with an error, sometimes
+quietly by returning numbers that look reasonable and aren't. Fixes land here as
+that happens.
+
+A cloned copy picks them up with `git pull`. A file saved from Raw never will,
+and gives you no signal that it has gone stale. There are deliberately no
+tagged releases for this reason: with a tool that depends on someone else's
+markup, a pinned version is a liability rather than a safeguard.
 
 **Windows note.** If `python --version` opens the Microsoft Store or prints
 nothing useful, you have Windows' placeholder rather than a real Python. Install

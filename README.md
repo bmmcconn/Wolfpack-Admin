@@ -14,6 +14,42 @@ and no third-party dependencies.
 | [`class_search.py`](class_search.py) | What sections are offered this term, and how full are they *right now*? |
 | [`postgrad_outcomes.py`](postgrad_outcomes.py) | Where do a program's graduates end up — salaries, employers, job titles? |
 
+## Requirements & getting started
+
+**Python 3.8 or newer. Nothing else.** No `pip install`, no dependencies, no API
+key, no account. Check what you have:
+
+```
+python --version
+```
+
+**Getting the files.** Either clone the repo, or just download the one tool you
+want — each is a single self-contained file:
+
+```
+git clone https://github.com/bmmcconn/Wolfpack-Admin.git
+```
+
+To grab a single file instead, open it above, click **Raw**, and save it. Then run
+it from whatever folder you saved it in.
+
+**Windows note.** If `python --version` opens the Microsoft Store or prints
+nothing useful, you have Windows' placeholder rather than a real Python. Install
+from [python.org](https://www.python.org/downloads/) (tick **"Add python.exe to
+PATH"** during setup), then use the bundled launcher, which sidesteps the
+placeholder entirely:
+
+```
+py class_search.py EM --term "Fall 2026"
+```
+
+If a plain `python` still misbehaves after installing, turn off the aliases at
+**Settings → Apps → Advanced app settings → App execution aliases** (switch off
+the `python.exe` and `python3.exe` entries).
+
+**These tools read live public web pages** and write nothing anywhere. Re-run
+them any time; there is no state to manage and nothing to uninstall.
+
 ## class_search.py
 
 Query NC State **Class Search** (go.ncsu.edu/class_search) for term-specific

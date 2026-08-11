@@ -36,9 +36,17 @@ Each course dict:
 Each section dict:
     {section, component, class_number, status, enrolled, capacity, waitlist,
      seats_available, mode, days, time, location, instructor, start_date,
-     end_date, notes}
+     end_date, notes, syllabus}
 `waitlist` is the parenthetical count in the Avail. column; it has only ever been
 observed as 0, so treat its exact semantics (waitlist vs reserved) as unverified.
+
+`syllabus` (bool) is TRUE when Class Search publishes a syllabus for that class
+number. Class Search emits the syllabus.php link only for sections that have one
+(verified 2026-07-30 against the alternative endpoint, which returns "No published
+syllabus was found." for every section lacking the link). This makes the field a
+usable REG 02.20.07 compliance check. ⚠️ Cross-listed sections are tracked
+SEPARATELY: a syllabus posted under EM 538 does NOT mark ISE 538 compliant, so
+check every prefix a course carries (see `also_listed_as`).
 
 Failure posture: unknown subjects, unparseable results markup, and network
 errors all raise ClassSearchError (never a silent empty list); sections whose
@@ -95,6 +103,11 @@ TIME_RE = re.compile(r"\d{1,2}:\d{2}\s*[AP]M\s*-\s*\d{1,2}:\d{2}\s*[AP]M")
 AVAIL_RE = re.compile(
     r"(Open|Closed|Waitlist|Reserved)\s*(\d+)\s*/\s*(\d+)(?:\s*\((\d+)\))?"
 )
+# Class Search renders a syllabus icon linking to syllabus.php?strm=..&class_nbr=N
+# ONLY for sections that have a published syllabus. Verified 2026-07-30: for a
+# section with no link, syllabus.php returns a 32-byte page reading "No published
+# syllabus was found." The link therefore IS the compliance signal.
+SYLLABUS_RE = re.compile(r"syllabus\.php\?[^\"']*?class_nbr=(\d+)")
 
 
 class ClassSearchError(RuntimeError):
@@ -264,10 +277,14 @@ def _parse_section(tr):
     # matching the whole row would false-positive on popover data-content text.
     mode = "online" if "Distance Education" in (tds[5] if len(tds) > 5 else "") \
         else "in-person"
+    class_number = _clean(tds[2])
+    # Match the link's OWN class_nbr against this row's, so a mis-split row can't
+    # borrow its neighbour's syllabus link (the surrounding markup is malformed).
+    syllabus = any(m.group(1) == class_number for m in SYLLABUS_RE.finditer(tr))
     return {
         "section": _clean(tds[0]),
         "component": _clean(tds[1]),
-        "class_number": _clean(tds[2]),
+        "class_number": class_number,
         "status": status,
         "enrolled": enrolled,
         "capacity": capacity,
@@ -281,6 +298,7 @@ def _parse_section(tr):
         "start_date": start_date,
         "end_date": end_date,
         "notes": notes,
+        "syllabus": syllabus,
     }
 
 
@@ -456,7 +474,7 @@ CSV_FIELDS = [
     "pulled", "term", "subject", "number", "title", "units", "also_listed_as",
     "section", "component", "class_number", "status", "enrolled", "capacity",
     "waitlist", "seats_available", "mode", "days", "time", "location",
-    "instructor", "start_date", "end_date", "notes",
+    "instructor", "start_date", "end_date", "notes", "syllabus",
 ]
 
 
@@ -522,8 +540,9 @@ def summarize_by_mode(courses):
 def _fmt_courses(courses, strm):
     lines = [f"NC State Class Search — {term_label(strm)} ({strm})",
              f"Pulled {date.today().isoformat()}  ·  Avail = seats available / "
-             f"capacity; Enr = enrolled (capacity - available)", ""]
-    tot_a = tot_c = tot_e = tot_s = 0
+             f"capacity; Enr = enrolled (capacity - available)",
+             "SYL = published syllabus in Class Search; NO-SYL = none published", ""]
+    tot_a = tot_c = tot_e = tot_s = tot_syl = 0
     for c in courses:
         alt = f"  (= {c['also_listed_as']})" if c["also_listed_as"] else ""
         u = f" · {c['units']} cr" if c["units"] else ""
@@ -543,14 +562,17 @@ def _fmt_courses(courses, strm):
             when = " ".join(x for x in (s["days"], s["time"]) if x) or "TBD"
             mode = "Online" if s["mode"] == "online" else "In-person"
             instr = s["instructor"] or "—"
+            syl = "SYL" if s["syllabus"] else "NO-SYL"
+            tot_syl += 1 if s["syllabus"] else 0
             lines.append(
                 f"    {s['section']:>3} {s['component']:<4} #{s['class_number']:<6}"
                 f" Avail {avail:>7}{wl:<6} Enr {enr:>3}  {(s['status'] or ''):<8} "
-                f"{mode:<9} {when:<22} {instr}"
+                f"{mode:<9} {when:<22} {syl:<6} {instr}"
             )
         lines.append("")
     lines.append(f"{len(courses)} courses · {tot_s} sections · "
-                 f"TOTAL Avail {tot_a}/{tot_c} · Enrolled {tot_e}")
+                 f"TOTAL Avail {tot_a}/{tot_c} · Enrolled {tot_e} · "
+                 f"Syllabi {tot_syl}/{tot_s}")
     return "\n".join(lines)
 
 

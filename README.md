@@ -9,12 +9,18 @@ human at a terminal. Each is a single stdlib-only Python file with a documented,
 importable API, so an agent can read it, invoke it, and compose it with no setup
 and no third-party dependencies.
 
+| Tool | What it answers |
+|------|-----------------|
+| [`class_search.py`](class_search.py) | What sections are offered this term, and how full are they *right now*? |
+| [`postgrad_outcomes.py`](postgrad_outcomes.py) | Where do a program's graduates end up — salaries, employers, job titles? |
+
 ## class_search.py
 
 Query NC State **Class Search** (go.ncsu.edu/class_search) for term-specific
 sections with **live availability** (seats available/capacity, plus derived
-enrolled), meeting times, instructor, mode (on-campus vs. online), and cross-listings. Pure Python standard library —
-no third-party dependencies, no API key.
+enrolled), meeting times, instructor, mode (on-campus vs. online), published-syllabus
+status, and cross-listings. Pure Python standard library — no third-party
+dependencies, no API key.
 
 ### Quick start
 
@@ -55,10 +61,73 @@ A bare calendar year (`--term 2026`) is rejected as ambiguous.
 - **Cross-listed** sections share one roster across every subject code they carry,
   so summing the same course under two subjects double-counts it.
 
+### Syllabus status (`SYL` / `NO-SYL`)
+
+Class Search emits a syllabus link only for sections that actually have one
+published, so the link's presence is a usable signal. ⚠️ **Cross-listed sections
+are tracked separately**: a syllabus posted under one subject code does *not* mark
+the other code's listing as having one. Check every prefix a course carries — see
+the `also_listed_as` field.
+
 ### PowerShell note
 
 Quote inequality arguments so the shell does not treat them as redirection:
 `--ineq "<="`.
+
+## postgrad_outcomes.py
+
+Query NC State **Post-Graduate Employment** outcomes (University Data and
+Analytics' Future Plans Survey / Survey of Recent Graduates) for one or more
+academic programs: graduates, respondents, response rate, grad-school vs.
+full-time-job counts, average and median starting salary, and — optionally — the
+employers and job titles respondents reported. Public source, no login.
+
+Everything it returns is **aggregate institutional data already published by the
+university**; there are no student-level records.
+
+### Quick start
+
+```
+python postgrad_outcomes.py -p "Engineering Management"          # one program
+python postgrad_outcomes.py -p 14SCEMMR                          # by plan code
+python postgrad_outcomes.py -p "Industrial Engineering"          # substring: pulls every match
+python postgrad_outcomes.py --college 14 --all                   # every plan in a college
+python postgrad_outcomes.py -p 14SCEMMR --titles                 # employers + job titles
+python postgrad_outcomes.py -p 14SCEMMR --titles --csv           # ...spreadsheet-ready
+python postgrad_outcomes.py -p 14SCEMMR --with-college           # + college total row
+python postgrad_outcomes.py --list --college 14                  # plan codes and names
+python postgrad_outcomes.py --list-colleges
+```
+
+`--level` selects `Seniors` (bachelor's), `Masters` (default), or `Doctoral`.
+
+### Job titles
+
+`--titles` returns one row per employed respondent — plan code, program, company,
+job title — in long format, so it survives `--csv`/`--json` and concatenates
+cleanly across programs. The source publishes exactly two fields here, company and
+job title; there is no location, industry, or degree-relatedness data to be had.
+Titles are respondent-entered and uncleaned (`Sr. Manager`, `Program Manager 2`),
+so normalize before counting by category.
+
+`--detail` additionally prints further-education rows, but only to the terminal —
+use `--titles` when you need the data in a file.
+
+### Reading the numbers
+
+- **`Reporting Salary` is a count of respondents, not a dollar figure.** It is how
+  many people reported a salary, which is usually smaller than the number employed.
+- Salary cells read `*Data Unavailable` when too few responses exist to publish;
+  those come back as empty, never `0`.
+- **Check the base before quoting a median.** Response rates run near 50%, and for
+  smaller programs a published median can rest on a handful of salaries. The
+  respondent count is right there in the table — use it.
+- **Duplicate plan names are real.** Several distinct plan codes share a name, and
+  some names appear in more than one college, so a name substring can legitimately
+  resolve to several rows. The tool pulls all matches and says so; use a plan code
+  when you need exactly one.
+- Job-title row counts should equal the summary's `Full Time Job` column — a free
+  sanity check on any pull.
 
 ## License
 

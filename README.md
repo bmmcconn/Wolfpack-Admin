@@ -50,6 +50,10 @@ and gives you no signal that it has gone stale. There are deliberately no
 tagged releases for this reason: with a tool that depends on someone else's
 markup, a pinned version is a liability rather than a safeguard.
 
+**[CHANGELOG.md](CHANGELOG.md) records what changed and when**, and flags the
+changes that alter the numbers a tool returns. Worth a glance after a `git pull`
+if you have saved output from an earlier run.
+
 **Windows note.** If `python --version` opens the Microsoft Store or prints
 nothing useful, you have Windows' placeholder rather than a real Python. Install
 from [python.org](https://www.python.org/downloads/) (tick **"Add python.exe to

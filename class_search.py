@@ -35,10 +35,20 @@ Each course dict:
     {subject, number, title, units, also_listed_as, enrolled, capacity, sections:[...]}
 Each section dict:
     {section, component, class_number, status, enrolled, capacity, waitlist,
-     seats_available, mode, days, time, location, instructor, start_date,
-     end_date, notes, syllabus}
+     seats_available, mode, distance_ed, days, time, location, instructor,
+     start_date, end_date, notes, syllabus}
 `waitlist` is the parenthetical count in the Avail. column; it has only ever been
 observed as 0, so treat its exact semantics (waitlist vs reserved) as unverified.
+
+`mode` vs `distance_ed` are DIFFERENT questions and both are kept. `mode`
+("online"/"in-person") is how the section physically meets; `distance_ed` (bool)
+is whether it is DE-coded. A synchronous DE section meets in a room AND is
+DE-coded, so it is mode="in-person" with distance_ed=True. `--summary` splits on
+`distance_ed`, which is the line that matters for enrollment reporting.
+
+⚠️ Every server-side filter is ADVISORY -- Class Search returns extra rows for
+--instructor, --open-only and --mode alike. search_classes() re-applies all three
+against the parsed data; see the comments at the end of it for each case.
 
 `syllabus` (bool) is TRUE when Class Search publishes a syllabus for that class
 number. Class Search emits the syllabus.php link only for sections that have one
@@ -56,6 +66,8 @@ CLI (output is BY COURSE, Avail/Cap + Enrolled per section):
     class_search.py EM --term "Fall 2026"
     class_search.py EM --term 2268 --open-only
     class_search.py MAE --term 2268 --mode online
+    class_search.py ISE --term 2268 --distance-ed             # all DE-coded sections
+    class_search.py ISE --term 2268 --distance-ed --mode in-person   # synchronous DE
     class_search.py EM --term 2268 --json     # structured; includes pulled_at
     class_search.py EM --term 2268 --csv      # flat, one row per section
     class_search.py EM --term 2268 --summary  # per-course: on-campus vs online
@@ -273,10 +285,20 @@ def _parse_section(tr):
         if t and t not in notes_seen:
             notes_seen.append(t)
     notes = " | ".join(notes_seen)
-    # Mode comes from the LOCATION cell only ("Distance Education - Online");
-    # matching the whole row would false-positive on popover data-content text.
+    # `mode` is PHYSICAL delivery and comes from the LOCATION cell only
+    # ("Distance Education - Online"); matching the whole row would
+    # false-positive on popover data-content text.
     mode = "online" if "Distance Education" in (tds[5] if len(tds) > 5 else "") \
         else "in-person"
+    # `distance_ed` is how the section is CODED, which is a different question --
+    # a DE section can meet in a room (synchronous DE broadcast to remote
+    # students), e.g. ISE 408-601 Fall 2026: room 4134 Fitts-Woolard, M/W 1:30,
+    # and DE-coded. Neither signal alone is complete: two ISE sections carry the
+    # notes marker without the location one, and a CSC section the reverse
+    # (verified 2026-08-11). Keep both fields -- collapsing them loses real
+    # information either way.
+    distance_ed = (mode == "online"
+                   or "DISTANCE EDUCATION COURSE" in notes.upper())
     class_number = _clean(tds[2])
     # Match the link's OWN class_nbr against this row's, so a mis-split row can't
     # borrow its neighbour's syllabus link (the surrounding markup is malformed).
@@ -291,6 +313,7 @@ def _parse_section(tr):
         "waitlist": waitlist,
         "seats_available": seats,
         "mode": mode,
+        "distance_ed": distance_ed,
         "days": days,
         "time": time,
         "location": location,
@@ -351,18 +374,46 @@ def _parse_results(html_str):
     return courses
 
 
+def _filter_sections(courses, keep):
+    """Keep only sections satisfying `keep`; drop emptied courses; fix totals.
+
+    Every server-side filter this module exposes has turned out to be advisory --
+    Class Search returns extra rows and leaves the caller to sort it out (see the
+    callers for the specific cases). So each one is re-applied here against the
+    parsed data.
+
+    Course-level enrolled/capacity are RECOMPUTED, never carried over: they were
+    summed across the UNFILTERED section list when the course was built, so
+    keeping them would trade a wrong section count for a wrong headcount.
+    """
+    kept = []
+    for c in courses:
+        secs = [s for s in c["sections"] if keep(s)]
+        if not secs:
+            continue
+        c["sections"] = secs
+        c["enrolled"] = sum(s["enrolled"] for s in secs if s["enrolled"] is not None)
+        c["capacity"] = sum(s["capacity"] for s in secs if s["capacity"] is not None)
+        kept.append(c)
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def search_classes(term, subject, *, course_number=None, course_inequality="=",
                    career=None, session=None, start_time=None, end_time=None,
-                   instructor=None, open_only=False, mode=None, timeout=30):
+                   instructor=None, open_only=False, mode=None, distance_ed=None,
+                   timeout=30):
     """Query Class Search and return a list of course dicts (see module docstring).
 
     term    : strm ("2268") or friendly ("Fall 2026").
     subject : subject prefix, e.g. "EM", "MAE", "ISE" (required by the site).
     mode    : None (all) | "online"/"distance" | "in-person"/"campus".
+              PHYSICAL delivery. Orthogonal to distance_ed -- combine them to get
+              synchronous DE (distance_ed=True, mode="in-person").
+    distance_ed : None (all) | True (DE-coded only) | False (on-campus-coded only).
     open_only : True -> only sections with seats available.
     course_number + course_inequality ("=", "<=", ">=") : filter by catalog number.
     """
@@ -396,12 +447,15 @@ def search_classes(term, subject, *, course_number=None, course_inequality="=",
     if open_only:
         params["open-classes"] = "1"
     if mode:
-        m = str(mode).lower()
-        if m in ("online", "distance", "distance-only", "de"):
-            params["distance-only"] = "1"
-        elif m in ("in-person", "campus", "campus-only"):
-            params["distance-only"] = "0"
-        else:
+        # Validate here, but deliberately DON'T send "distance-only" to the
+        # server. That parameter selects DE-CODED sections, so it cannot express
+        # `mode` (physical delivery) now that the two are known to differ -- and
+        # sending it would make mode/distance_ed uncombinable: asking for
+        # DE-coded sections that meet in a room (distance_ed=True, mode
+        # in-person) would set distance-only=0 and have the server drop exactly
+        # the rows wanted. Both filters are applied below against parsed data.
+        if str(mode).lower() not in ("online", "distance", "distance-only", "de",
+                                     "in-person", "campus", "campus-only"):
             raise ValueError(
                 f"mode must be 'online' or 'in-person' (Class Search has no "
                 f"hybrid filter), got {mode!r}")
@@ -433,6 +487,31 @@ def search_classes(term, subject, *, course_number=None, course_inequality="=",
             raise ClassSearchError(
                 f"subject {subject!r} is not offered in {term_label(strm)} "
                 f"({strm}) — unknown or mistyped subject")
+    # --- Re-apply every filter the server treats as advisory (all verified
+    # --- 2026-08-11 against Fall 2026; each returns extra rows server-side).
+    if instructor:
+        # instructor-name is applied only to sections that HAVE an instructor of
+        # record; every unassigned ("Staff"/TBA) section comes back regardless.
+        # ISE: `--instructor Mayorga` returned 1 real hit and 18 Staff sections.
+        needle = instructor.strip().lower()
+        courses = _filter_sections(
+            courses, lambda s: needle in (s["instructor"] or "").lower())
+    if open_only:
+        # "open-classes" means NOT CLOSED, which includes Waitlist sections with
+        # zero seats left. This module documents open_only as "has seats", so
+        # honour that: ISE dropped 16 zero-seat Waitlist sections.
+        courses = _filter_sections(courses, lambda s: (s["seats_available"] or 0) > 0)
+    if mode:
+        # "distance-only" selects DE-CODED sections, which is not the same as
+        # "meets online" -- a DE section can meet in a room. Filter on the
+        # physical `mode` so the rows match the flag the caller asked for; use
+        # the `distance_ed` field (or --summary) for the DE/on-campus split.
+        want = "online" if str(mode).lower() in (
+            "online", "distance", "distance-only", "de") else "in-person"
+        courses = _filter_sections(courses, lambda s: s["mode"] == want)
+    if distance_ed is not None:
+        want_de = bool(distance_ed)
+        courses = _filter_sections(courses, lambda s: s["distance_ed"] == want_de)
     return courses
 
 
@@ -473,7 +552,7 @@ def list_subjects(term, timeout=30):
 CSV_FIELDS = [
     "pulled", "term", "subject", "number", "title", "units", "also_listed_as",
     "section", "component", "class_number", "status", "enrolled", "capacity",
-    "waitlist", "seats_available", "mode", "days", "time", "location",
+    "waitlist", "seats_available", "mode", "distance_ed", "days", "time", "location",
     "instructor", "start_date", "end_date", "notes", "syllabus",
 ]
 
@@ -497,15 +576,21 @@ def flatten_sections(courses, term="", pulled=""):
 
 
 def summarize_by_mode(courses):
-    """Roll each course's sections up into on-campus vs online Enr/Cap totals.
+    """Roll each course's sections up into on-campus vs distance-ed Enr/Cap totals.
+
+    Splits on `distance_ed` (how the section is CODED), not `mode` (how it
+    physically meets) -- for enrollment reporting the DE/on-campus line is the
+    one that matters, and a DE section that meets in a room belongs on the DE
+    side of it. The `online_*` keys are named for that column's meaning to a
+    reader, not for the `mode` field.
 
     Returns one dict per course:
         {subject, number, title, also_listed_as,
          campus_enrolled, campus_capacity, online_enrolled, online_capacity}
-    A mode's Enr/Cap is None when the course has NO section of that mode (so the
-    CLI can print "—"), versus 0/N when a section exists but is empty. Sections
-    with an unparseable Avail. cell are skipped, matching the course-total
-    convention in _parse_results().
+    A side's Enr/Cap is None when the course has NO such section (so the CLI can
+    print "—"), versus 0/N when a section exists but is empty. Sections with an
+    unparseable Avail. cell are skipped, matching the course-total convention in
+    _parse_results().
 
     Caveat for cross-listed courses: a shared online section is reported under
     every subject code it carries (see `also_listed_as`), so summing the same
@@ -517,7 +602,7 @@ def summarize_by_mode(courses):
         for s in c["sections"]:
             if s["enrolled"] is None:
                 continue
-            bucket = agg["online"] if s["mode"] == "online" else agg["in-person"]
+            bucket = agg["online"] if s["distance_ed"] else agg["in-person"]
             bucket[0] += s["enrolled"]
             bucket[1] += s["capacity"]
             bucket[2] = True
@@ -633,7 +718,16 @@ def main(argv=None):
                     help="course-number comparison (default '=')")
     ap.add_argument("--career", help="undergraduate | graduate | veterinary | agricultural")
     ap.add_argument("--instructor", help="instructor last name")
-    ap.add_argument("--mode", choices=["online", "in-person"], help="filter by mode")
+    ap.add_argument("--mode", choices=["online", "in-person"],
+                    help="filter by how the section physically meets")
+    # Paired store_true/store_false with default=None gives a tri-state (unset /
+    # DE-only / on-campus-only). argparse.BooleanOptionalAction would be tidier
+    # but is 3.9+, and this module supports 3.8.
+    ap.add_argument("--distance-ed", dest="distance_ed", action="store_true",
+                    default=None, help="only DE-coded sections (incl. those that "
+                                       "meet in a room)")
+    ap.add_argument("--no-distance-ed", dest="distance_ed", action="store_false",
+                    help="only on-campus-coded sections")
     ap.add_argument("--open-only", action="store_true", help="only sections with open seats")
     fmt = ap.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="structured JSON output")
@@ -673,6 +767,7 @@ def main(argv=None):
         courses = search_classes(
             strm, args.subject, course_number=args.number, course_inequality=args.ineq,
             career=args.career, instructor=args.instructor, mode=args.mode,
+            distance_ed=args.distance_ed,
             open_only=args.open_only, timeout=args.timeout,
         )
     except (ClassSearchError, ValueError) as e:

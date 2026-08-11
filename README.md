@@ -64,6 +64,8 @@ dependencies, no API key.
 python class_search.py EM --term "Fall 2026"
 python class_search.py EM --term 2268 --open-only
 python class_search.py MAE --term 2268 --mode online
+python class_search.py ISE --term 2268 --distance-ed             # all DE-coded sections
+python class_search.py ISE --term 2268 --distance-ed --mode in-person   # synchronous DE
 python class_search.py EM --term 2268 --json      # structured JSON (stamps pulled_at)
 python class_search.py EM --term 2268 --csv       # one row per section (spreadsheet-ready)
 python class_search.py EM --term 2268 --summary   # per-course: on-campus vs. online
@@ -96,6 +98,27 @@ A bare calendar year (`--term 2026`) is rejected as ambiguous.
   `pulled` column, so repeated CSV pulls concatenate cleanly for tracking over time.
 - **Cross-listed** sections share one roster across every subject code they carry,
   so summing the same course under two subjects double-counts it.
+
+### Online vs. distance ed — two different questions
+
+A section can **meet in a room and still be distance-ed coded** (a synchronous DE
+section: it meets at a scheduled time and remote students join). So the tool
+reports both, and they don't always agree:
+
+| Field | Means | Filter |
+|-------|-------|--------|
+| `mode` | how it *physically meets* — `online` / `in-person` | `--mode online` |
+| `distance_ed` | how it is *coded* — DE tuition and reporting | `--distance-ed` |
+
+`--summary` splits on `distance_ed`, because for enrollment reporting that's the
+line that matters — a DE section meeting in a room belongs on the DE side of it.
+`--distance-ed --mode in-person` isolates exactly those synchronous sections.
+
+⚠️ **If you have used an earlier copy of this tool, re-check any on-campus vs.
+online split you produced.** Mode was previously inferred from the location cell
+alone, which classified synchronous DE sections as on-campus. In one department
+that understated distance-ed enrollment by half. Departments whose DE sections
+are all fully online were unaffected.
 
 ### Syllabus status (`SYL` / `NO-SYL`)
 

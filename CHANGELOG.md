@@ -12,6 +12,43 @@ Dates below are when a change was published to this repo.
 
 ---
 
+## 2026-08-14
+
+### Added
+
+- **`class_search.py` — special-topics sections now report their actual `topic`.**
+  The results table has a **Topic** column that this tool never read. Every
+  special-topics section (ISE 489/589, EM 589, and the equivalent in any other
+  subject) carries a catalog `title` of only "Special Topics in …", so the real
+  subject was invisible: **searching titles found none of them.** Sections now
+  carry a `topic` field, printed beneath the section line, added to `--csv` as a
+  new column, and present in `--json`. Example: ISE 589-012, Spring 2026 — title
+  "Special Topics In Industrial Engineering", topic "Optimization for Machine
+  Learning". This is where a department's newest courses appear before they are
+  assigned a permanent number, so it is the field to search when asking what is
+  actually being taught.
+
+### Fixed
+
+- ⚠️ **`class_search.py` — every field from `Avail.` rightward was wrong for past
+  terms.** The results table's column *set* is not constant: terms whose
+  enrollment has closed omit the **Avail.** column entirely, shifting every later
+  column one place left. The parser read fixed column positions, so for those
+  terms it returned the **Begin/End date in the `instructor` field**, the
+  instructor in `location`, and no meeting days or times at all. Current and
+  future terms were unaffected, which is why this went unnoticed. Cells are now
+  located by **header name**, so a column set that varies — or is reordered —
+  parses correctly either way. Re-check any saved pull of a completed term.
+- **`class_search.py` — the "unparseable Avail. cell" warning fired on every
+  course in every completed term.** Those terms publish no Avail. column at all;
+  that is absent data, not the markup drift the warning is meant to catch, and a
+  warning that always fires is one nobody reads. Courses now carry
+  `enrollment_published`, the warning is limited to genuine drift, and the CLI
+  prints "enrollment not published for this term" instead of an
+  enrollment-shaped `Avail 0/0 · Enr 0` that reads as an empty class.
+
+---
+
 ## 2026-08-11
 
 ### Fixed
@@ -67,4 +104,4 @@ Dates below are when a change was published to this repo.
 - **`class_search.py`** — initial release. Term-specific section listings with
   live availability, meeting times, instructor, mode and cross-listings, plus
   `--json`, `--csv` and `--summary` output.
-- MIT licence.
+- MIT license.

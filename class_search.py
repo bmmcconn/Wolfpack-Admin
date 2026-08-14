@@ -32,13 +32,32 @@ Public API:
     summarize_by_mode(courses) -> per-course on-campus vs online Enr/Cap rollup
 
 Each course dict:
-    {subject, number, title, units, also_listed_as, enrolled, capacity, sections:[...]}
+    {subject, number, title, units, also_listed_as, enrolled, capacity,
+     enrollment_published, sections:[...]}
 Each section dict:
     {section, component, class_number, status, enrolled, capacity, waitlist,
      seats_available, mode, distance_ed, days, time, location, instructor,
-     start_date, end_date, notes, syllabus}
+     start_date, end_date, topic, notes, syllabus}
 `waitlist` is the parenthetical count in the Avail. column; it has only ever been
 observed as 0, so treat its exact semantics (waitlist vs reserved) as unverified.
+
+`topic` is the results table's **Topic** column: the real subject of a
+special-topics section (ISE 489/589, EM 589, ...), which the catalog `title`
+never carries -- every such section is titled only "Special Topics in ...".
+e.g. ISE 589-012 Spring 2026 has title "Special Topics In Industrial
+Engineering" and topic "Optimization for Machine Learning". Empty string for
+ordinary courses. **Searching titles alone will silently miss every
+special-topics offering**, which for ISE/EM is where new courses appear before
+they get a permanent number.
+
+⚠️ COLUMN ORDER IS NOT FIXED ACROSS TERMS -- cells are read by HEADER NAME, never
+by position. Current/future terms publish 10 columns; terms whose enrollment has
+closed publish 9, dropping **Avail.** and shifting every later column left by
+one. Parsing by position put the Begin/End date into `instructor` for past terms
+(verified 2026-08-14 against Fall 2025 and Spring 2026). `enrollment_published`
+(course level) is False when the term served no Avail. column, which is the
+honest reason status/enrolled/capacity/seats_available are all None -- distinct
+from markup drift, which still warns.
 
 `mode` vs `distance_ed` are DIFFERENT questions and both are kept. `mode`
 ("online"/"in-person") is how the section physically meets; `distance_ed` (bool)
@@ -252,14 +271,70 @@ def _parse_daytime(cell):
     return "/".join(days), (tm.group(0).strip() if tm else "")
 
 
-def _parse_section(tr):
-    """Parse one <tr> section row into a dict, or None if it isn't a data row."""
+# Results-table header label -> canonical section-dict key. Cells are located by
+# matching these against the <th> row, because the column SET varies by term (see
+# the module docstring: past terms omit "Avail." and shift everything after it).
+# Keys are whitespace-STRIPPED and lowercased, because the <th> labels are split
+# by responsive spans -- "Sec<span class='hidden-xs'>tion</span>" cleans to
+# "Sec tion", not "Section". Matching on the spaced form silently matches nothing,
+# which falls back to positional parsing and looks like it worked on current terms.
+HEADER_KEYS = {
+    "section": "section",
+    "component": "component",
+    "class#": "class_number",
+    "avail": "avail",
+    "day/time": "daytime",
+    "location": "location",
+    "instructor": "instructor",
+    "begin/enddates": "dates",
+    "topic": "topic",
+    "notes": "notes",
+}
+
+
+def _parse_header(block):
+    """Map canonical column key -> td index, from the results table's <th> row.
+
+    Returns {} when no header row is present, which makes every lookup in
+    _parse_section() fall back to its positional default.
+    """
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", block, re.S):
+        ths = re.findall(r"<th[^>]*>(.*?)</th>", tr, re.S)
+        if not ths:
+            continue
+        cols = {}
+        for i, raw in enumerate(ths):
+            name = re.sub(r"\s+", "", _clean(raw)).lower().rstrip(".")
+            key = HEADER_KEYS.get(name)
+            if key and key not in cols:
+                cols[key] = i
+        if "section" in cols:
+            return cols
+    return {}
+
+
+def _parse_section(tr, cols=None):
+    """Parse one <tr> section row into a dict, or None if it isn't a data row.
+
+    `cols` maps canonical key -> td index (see _parse_header). Positional
+    fallbacks apply only when a column is absent from the header map, and they
+    assume the 10-column layout that includes Avail.
+    """
     tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
     if len(tds) < 4:
         return None
-    avail = _clean(tds[3])
-    m = AVAIL_RE.search(avail)
+    cols = cols or {}
+
+    def cell(key, default_idx):
+        """Raw td for a column, by header position when known, else positional."""
+        idx = cols.get(key, default_idx)
+        return tds[idx] if idx is not None and idx < len(tds) else ""
+
+    # An absent Avail. column is a property of the TERM, not a parse failure --
+    # `avail_served` distinguishes the two so only real drift warns upstream.
+    avail_served = "avail" in cols or not cols
     status = enrolled = capacity = waitlist = seats = None
+    m = AVAIL_RE.search(_clean(cell("avail", 3))) if avail_served else None
     if m:
         status = m.group(1)
         # NC State's "Avail." column is SEATS AVAILABLE / CAPACITY, not enrolled
@@ -267,12 +342,14 @@ def _parse_section(tr):
         seats, capacity = int(m.group(2)), int(m.group(3))
         waitlist = int(m.group(4)) if m.group(4) is not None else None
         enrolled = capacity - seats
-    days = time = ""
-    if len(tds) > 4:
-        days, time = _parse_daytime(tds[4])
-    location = _clean(tds[5]) if len(tds) > 5 else ""
-    instructor = _clean(tds[6]) if len(tds) > 6 else ""
-    dates = _clean(tds[7]) if len(tds) > 7 else ""
+    days, time = _parse_daytime(cell("daytime", 4))
+    location = _clean(cell("location", 5))
+    instructor = _clean(cell("instructor", 6))
+    # The Topic column carries the real subject of a special-topics section; the
+    # catalog title only ever says "Special Topics in ...". No positional default:
+    # guessing an index would invent topics on terms that don't serve the column.
+    topic = _clean(cell("topic", None)) if "topic" in cols else ""
+    dates = _clean(cell("dates", 7))
     start_date = end_date = ""
     dm = re.match(r"(\S+)\s*-\s*(\S+)", dates)
     if dm:
@@ -288,8 +365,7 @@ def _parse_section(tr):
     # `mode` is PHYSICAL delivery and comes from the LOCATION cell only
     # ("Distance Education - Online"); matching the whole row would
     # false-positive on popover data-content text.
-    mode = "online" if "Distance Education" in (tds[5] if len(tds) > 5 else "") \
-        else "in-person"
+    mode = "online" if "Distance Education" in cell("location", 5) else "in-person"
     # `distance_ed` is how the section is CODED, which is a different question --
     # a DE section can meet in a room (synchronous DE broadcast to remote
     # students), e.g. ISE 408-601 Fall 2026: room 4134 Fitts-Woolard, M/W 1:30,
@@ -299,13 +375,13 @@ def _parse_section(tr):
     # information either way.
     distance_ed = (mode == "online"
                    or "DISTANCE EDUCATION COURSE" in notes.upper())
-    class_number = _clean(tds[2])
+    class_number = _clean(cell("class_number", 2))
     # Match the link's OWN class_nbr against this row's, so a mis-split row can't
     # borrow its neighbour's syllabus link (the surrounding markup is malformed).
     syllabus = any(m.group(1) == class_number for m in SYLLABUS_RE.finditer(tr))
     return {
-        "section": _clean(tds[0]),
-        "component": _clean(tds[1]),
+        "section": _clean(cell("section", 0)),
+        "component": _clean(cell("component", 1)),
         "class_number": class_number,
         "status": status,
         "enrolled": enrolled,
@@ -320,6 +396,7 @@ def _parse_section(tr):
         "instructor": instructor,
         "start_date": start_date,
         "end_date": end_date,
+        "topic": topic,
         "notes": notes,
         "syllabus": syllabus,
     }
@@ -346,15 +423,20 @@ def _parse_results(html_str):
             re.sub(r"\s+", " ", code)
             for code in re.findall(r"[A-Z]{1,4}\s*\d{2,3}[A-Z]?", also.group(1))
         ) if also else ""
+        cols = _parse_header(block)
         sections = []
         for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", block, re.S):
             if "<td" not in tr:
                 continue
-            sec = _parse_section(tr)
+            sec = _parse_section(tr, cols)
             if sec:
                 sections.append(sec)
+        # No Avail. column at all = this term has closed enrollment and the site
+        # simply doesn't publish the numbers. That is not markup drift, so it must
+        # not warn -- warning on it trained the reader to ignore a real signal.
+        enrollment_published = "avail" in cols or not cols
         bad_avail = sum(1 for s in sections if s["enrolled"] is None)
-        if bad_avail:
+        if bad_avail and enrollment_published:
             warnings.warn(
                 f"{head.group(1)} {head.group(2)}: {bad_avail} section(s) had an "
                 "unparseable Avail. cell — course Enr/Cap totals exclude them "
@@ -369,6 +451,7 @@ def _parse_results(html_str):
             "also_listed_as": also_listed,
             "enrolled": enr,
             "capacity": cap,
+            "enrollment_published": enrollment_published,
             "sections": sections,
         })
     return courses
@@ -551,7 +634,7 @@ def list_subjects(term, timeout=30):
 
 CSV_FIELDS = [
     "pulled", "term", "subject", "number", "title", "units", "also_listed_as",
-    "section", "component", "class_number", "status", "enrolled", "capacity",
+    "section", "component", "class_number", "topic", "status", "enrolled", "capacity",
     "waitlist", "seats_available", "mode", "distance_ed", "days", "time", "location",
     "instructor", "start_date", "end_date", "notes", "syllabus",
 ]
@@ -631,9 +714,13 @@ def _fmt_courses(courses, strm):
     for c in courses:
         alt = f"  (= {c['also_listed_as']})" if c["also_listed_as"] else ""
         u = f" · {c['units']} cr" if c["units"] else ""
-        c_avail = c["capacity"] - c["enrolled"]
-        lines.append(f"{c['subject']} {c['number']}  {c['title']}{u}"
-                     f"   [Avail {c_avail}/{c['capacity']} · Enr {c['enrolled']}]{alt}")
+        # Printing "Avail 0/0 · Enr 0" for a term that publishes no enrollment
+        # reads as an empty course rather than as absent data.
+        if c.get("enrollment_published", True):
+            roll = f"[Avail {c['capacity'] - c['enrolled']}/{c['capacity']} · Enr {c['enrolled']}]"
+        else:
+            roll = "[enrollment not published for this term]"
+        lines.append(f"{c['subject']} {c['number']}  {c['title']}{u}   {roll}{alt}")
         for s in c["sections"]:
             tot_s += 1
             if s["seats_available"] is not None:
@@ -654,9 +741,16 @@ def _fmt_courses(courses, strm):
                 f" Avail {avail:>7}{wl:<6} Enr {enr:>3}  {(s['status'] or ''):<8} "
                 f"{mode:<9} {when:<22} {syl:<6} {instr}"
             )
+            # The real subject of a special-topics section. Its own line because it
+            # is the only place the actual course content appears.
+            if s.get("topic"):
+                lines.append(f"{'':>9}topic: {s['topic']}")
         lines.append("")
-    lines.append(f"{len(courses)} courses · {tot_s} sections · "
-                 f"TOTAL Avail {tot_a}/{tot_c} · Enrolled {tot_e} · "
+    # Same reason as the per-course rollup: a 0/0 total for a term that publishes
+    # no Avail. column would read as "nobody enrolled".
+    totals = (f"TOTAL Avail {tot_a}/{tot_c} · Enrolled {tot_e}" if tot_c
+              else "enrollment not published for this term")
+    lines.append(f"{len(courses)} courses · {tot_s} sections · {totals} · "
                  f"Syllabi {tot_syl}/{tot_s}")
     return "\n".join(lines)
 

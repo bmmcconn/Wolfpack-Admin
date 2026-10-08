@@ -95,6 +95,8 @@ python class_search.py --list-subjects --term 2268
 ```
 
 A subject is required — Class Search will not return an entire term at once.
+Without `--term`, the tool uses the term Class Search itself opens on
+(`--list-terms` marks it `(default)`), and says so on stderr.
 
 ### Term codes
 
@@ -117,8 +119,13 @@ A bare calendar year (`--term 2026`) is rejected as ambiguous.
 - Counts are **live** and move daily until the term settles, so a saved pull is a
   point-in-time snapshot. `--json` stamps `pulled_at` and `--csv` stamps a
   `pulled` column, so repeated CSV pulls concatenate cleanly for tracking over time.
-- **Cross-listed** sections share one roster across every subject code they carry,
-  so summing the same course under two subjects double-counts it.
+- **Cross-listed** listings are separate classes, each with its own class number
+  and enrollment, so a per-subject total counts only the students enrolled under
+  that prefix. A course's real size is the sum across every code in
+  `also_listed_as` (one Fall 2026 course: 37 under one prefix + 4 under the
+  other = 41). Earlier copies of this README said the opposite.
+- Once a term ends, Class Search stops publishing seat counts. The tool then
+  reports enrollment as not published (`null` in `--json`), never as 0/0.
 
 ### Online vs. distance ed — two different questions
 
@@ -144,7 +151,10 @@ are all fully online were unaffected.
 ### Syllabus status (`SYL` / `NO-SYL`)
 
 Class Search emits a syllabus link only for sections that actually have one
-published, so the link's presence is a usable signal. ⚠️ **Cross-listed sections
+published, so the link's presence is a usable signal — but **only while a term
+is in session**. Class Search shows no syllabus links at all before a term
+starts or after it ends, so outside a session the flag is blank (`null` in
+`--json`) rather than `NO-SYL`. ⚠️ **Cross-listed sections
 are tracked separately**: a syllabus posted under one subject code does *not* mark
 the other code's listing as having one. Check every prefix a course carries — see
 the `also_listed_as` field.

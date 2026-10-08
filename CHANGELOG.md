@@ -12,6 +12,62 @@ Dates below are when a change was published to this repo.
 
 ---
 
+## 2026-10-08
+
+### Fixed
+
+- ⚠️ **`class_search.py` — cross-listings were cut to the first code.** Class
+  Search separates a course's cross-listings with spaces, and the parser expected
+  commas, so it kept only the first: ISE 505 showed MA 505 but not OR 505 (17 of
+  64 cross-listed courses in one sample). `also_listed_as` now carries every
+  code. If you checked syllabi or enrollment across a course's prefixes, re-check.
+- ⚠️ **`class_search.py` — multi-line cells were run together.** A section that
+  meets at different times on different days lost every meeting time after the
+  first. Co-taught sections ran their instructors together ("Doe,Jane A.
+  Roe,John"), which can't be split back because names contain spaces, and
+  rooms were repeated. `days` and `time` now hold one entry per meeting, aligned
+  and joined with "; ". `instructor` and `location` list each entry once, joined
+  with "; ".
+- ⚠️ **`class_search.py` — with no `--term`, the tool queried the wrong term.**
+  It took the first entry in the site's term list, which is the coming Summer 2
+  term, not the term the site opens on. A bare `class_search.py EM` failed with
+  "unknown or mistyped subject", and `--summary` reported Summer 2 without saying
+  so. The tool now uses the site's own default, and says so on stderr.
+- ⚠️ **`class_search.py` — ended and future terms read as empty or
+  non-compliant.** Class Search stops publishing seat counts once a term ends,
+  and shows syllabus links only while a term is in session. So outside a session
+  the syllabus flag is now blank (`null` in `--json`) rather than `NO-SYL` on
+  every row. A term with no published seat counts now reports course totals as
+  `null`, not 0. `--summary` prints `n/a`, not 0/0, and `--open-only` stops with
+  an error instead of silently returning nothing. An empty result in a term
+  that does publish counts no longer claims "enrollment not published".
+- **`class_search.py` — term names.** "Summer 2026" was read as Summer 2 (from
+  the "2" in the year); it now means Summer 1, as documented. Years outside
+  2000-2099 are refused: "Fall 1999" became Fall 2099.
+- **`class_search.py` — errors.** A malformed `--number`, a bad subject-list
+  response, and a connection dropped mid-response now give a clear error instead
+  of a silent "0 courses" or a traceback. An unknown subject now reads "no ZZZ
+  sections in <term> — wrong term, or mistyped subject". Piping output into a
+  reader that stops early (`| head -1`) no longer prints a traceback on Windows.
+- **README — cross-listed totals.** The README said summing a cross-listed course
+  across subjects double-counts it. It's the reverse: each listing is a separate
+  class with its own enrollment, so the course's real size is the sum across its
+  listings, and a per-subject total undercounts it.
+
+### Added
+
+- **`class_search.py` — course `description` and `requisites`.** Class Search
+  already prints the catalog description and requisite text above each course;
+  the tool now keeps them (`--json`; `requisites` is also a new `--csv` column).
+- **`class_search.py` — section notes, split by kind.** `class_notes`,
+  `class_requisites`, and `seat_reserves`: a list of seat counts and who the
+  seats are reserved for, e.g. `{"seats": 40, "reserved_for": "R: MEM Students
+  Only"}`. They are new `--csv` columns, added at the end so older pulls still
+  line up. `notes` still holds all three.
+- **`class_search.py` — `--list-terms` marks the default term.**
+
+---
+
 ## 2026-08-14
 
 ### Added

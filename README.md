@@ -12,6 +12,7 @@ and no third-party dependencies.
 | Tool | What it answers |
 |------|-----------------|
 | [`class_search.py`](class_search.py) | What sections are offered this term, and how full are they *right now*? |
+| [`course_catalog.py`](course_catalog.py) | What does a course require, what does it cover, and when is it usually offered? |
 | [`postgrad_outcomes.py`](postgrad_outcomes.py) | Where do a program's graduates end up — salaries, employers, job titles? |
 
 ## Requirements & getting started
@@ -163,6 +164,62 @@ the `also_listed_as` field.
 
 Quote inequality arguments so the shell does not treat them as redirection:
 `--ineq "<="`.
+
+## course_catalog.py
+
+Query NC State's **Course Catalog** (go.ncsu.edu/course_catalog), the
+registrar's directory of courses, which doesn't change with the term: title,
+credit hours, requisite text, the terms a course is typically offered, GEP
+categories, cross- and dual-listings, the terms with sections currently
+scheduled, and the description. It complements `class_search.py`, which lists
+one term's sections and enrollment. Pure Python standard library — no
+third-party dependencies, no API key.
+
+### Quick start
+
+```
+python course_catalog.py NE 504                          # one course
+python course_catalog.py NE 501 504 MAE 308              # several, across subjects
+python course_catalog.py NE --career graduate --number 500-599 --brief
+python course_catalog.py NE --number 520 --ineq "<="     # NE courses up to 520
+python course_catalog.py --keyword "nuclear reactor"     # a phrase in descriptions
+python course_catalog.py --keyword "reactor safety" --any
+python course_catalog.py --gep HUM --brief               # a GEP category
+python course_catalog.py NE 504 --descr                  # add the description
+python course_catalog.py NE --json      # structured JSON (stamps pulled_at)
+python course_catalog.py NE --csv       # one row per course (spreadsheet-ready)
+python course_catalog.py --list-subjects
+python course_catalog.py --list-geps
+```
+
+Course codes can be typed as they come: `NE 504`, `NE504`, `NE-504`, or a
+pasted `"NE 504, MAE 308"`. A code the catalog doesn't have is reported, and the
+rest still print.
+
+### Reading the results
+
+- ⚠️ **NC State's two catalogs can disagree on requisites.** The University
+  Catalog (catalog.ncsu.edu) prints a dual-listed 400/500 course under both
+  numbers with one shared requisite text, usually the 400-level offering's. This
+  directory gives each offering its own: NE 501 here requires "NE 520, MA 401,
+  and CSC 112", while the University Catalog's NE 501 entry shows "MA 401 and C-
+  or better in NE 301". Say which source you quote.
+- `requisites` is the registrar's text, verbatim, not a parsed rule.
+- **Keyword search looks for one phrase, in course descriptions only**, whatever
+  the registrar's page calls it. Titles aren't searched ("reactor" misses NE 502
+  *Reactor Engineering*), and "reactor safety" finds nothing although ten
+  descriptions contain both words. `--any` finds descriptions with any of the
+  words.
+- `same_course_as` names the other number of a dual-listed course (NE 401 for
+  NE 501), which the registrar doesn't list as a cross-listing. A subject search
+  finds it, even with `--career`; a keyword or GEP search can miss it.
+- `scheduled_terms` lists the terms with sections on the schedule now. An empty
+  list means none are scheduled yet, not that the course is gone.
+
+### PowerShell note
+
+Quote inequality arguments (`--ineq "<="`); a range (`--number 500-599`) needs
+no quotes.
 
 ## postgrad_outcomes.py
 

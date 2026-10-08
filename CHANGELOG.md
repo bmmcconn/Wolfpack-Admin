@@ -56,6 +56,13 @@ Dates below are when a change was published to this repo.
 
 ### Added
 
+- **`course_catalog.py`** — new tool. Looks up courses in the registrar's Course
+  Catalog: title, credit hours, requisite text, the terms a course is typically
+  offered, GEP categories, cross- and dual-listings, the terms with sections
+  scheduled, and the description. Search by course code (several at once, across
+  subjects), by subject, by a phrase in course descriptions, or by GEP category.
+  Text, `--brief`, `--json` and `--csv` output. NC State's two catalogs can give
+  a dual-listed course different requisites; the README explains which is which.
 - **`class_search.py` — course `description` and `requisites`.** Class Search
   already prints the catalog description and requisite text above each course;
   the tool now keeps them (`--json`; `requisites` is also a new `--csv` column).

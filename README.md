@@ -84,6 +84,10 @@ dependencies, no API key.
 
 ```
 python class_search.py EM --term "Fall 2026"
+python class_search.py EM 501 --term 2271         # one course (EM501, EM-501 work too)
+python class_search.py "EM 501, ISE 543" EGR --term 2271    # codes and whole subjects
+python class_search.py EM ISE --term "Fall 2026, Spring 2027"   # several, run at once
+python class_search.py EM --term 2268 --summary --with-crosslists   # whole-class totals
 python class_search.py EM --term 2268 --open-only
 python class_search.py MAE --term 2268 --mode online
 python class_search.py ISE --term 2268 --distance-ed             # all DE-coded sections
@@ -96,8 +100,18 @@ python class_search.py --list-subjects --term 2268
 ```
 
 A subject is required — Class Search will not return an entire term at once.
-Without `--term`, the tool uses the term Class Search itself opens on
+Give several subjects, course codes, or terms (comma-separated or repeated
+`--term`) and the tool runs the queries concurrently, at most four at a time. A
+subject or course with no sections in a term is a note, and the rest still
+print. Without `--term`, the tool uses the term Class Search itself opens on
 (`--list-terms` marks it `(default)`), and says so on stderr.
+
+**Unpublished terms.** Class Search answers for terms its own term list doesn't
+offer yet, and those sections are the registrar's draft (in November 2026, the
+following Fall returned a full slate of courses with 0 enrolled). The tool checks
+every term against the published list. For a term that isn't on it, the tool
+warns on stderr, marks the output `!! UNPUBLISHED TERM`, and sets
+`term_published` to false in `--json` and `--csv`.
 
 ### Term codes
 
@@ -125,6 +139,9 @@ A bare calendar year (`--term 2026`) is rejected as ambiguous.
   that prefix. A course's real size is the sum across every code in
   `also_listed_as` (one Fall 2026 course: 37 under one prefix + 4 under the
   other = 41). Earlier copies of this README said the opposite.
+  `--with-crosslists` fetches the other listings and does that sum: the text
+  output adds a "whole class" line, `--summary` gives one row per class, and
+  `--json` adds `class_total` (added listings carry `crosslist_of`).
 - Once a term ends, Class Search stops publishing seat counts. The tool then
   reports enrollment as not published (`null` in `--json`), never as 0/0.
 
@@ -275,6 +292,21 @@ use `--titles` when you need the data in a file.
   when you need exactly one.
 - Job-title row counts should equal the summary's `Full Time Job` column — a free
   sanity check on any pull.
+
+### When something goes wrong
+
+- Columns are read by their header names, so a column the site adds can't shift
+  the numbers; the tool names it in a note. If a column it needs disappears or is
+  renamed, that program fails rather than printing blanks.
+- A program that fails (a network error, a timeout, a changed layout, an error
+  from the job-title endpoint) is named at the end and the run exits with code 1,
+  so a partial pull never passes for a complete one. In `--json` a failed program
+  appears with `"data": null` and an `"error"`.
+- Each reply gets 10 s (`--timeout` changes it), with two retries for timeouts
+  and server errors. If two programs in a row fail on network errors, the run
+  stops and names the programs it didn't try.
+- `--csv` output begins with a UTF-8 byte-order mark, so Excel shows dashes and
+  accented characters correctly. In Python, read it with `encoding="utf-8-sig"`.
 
 ## License
 

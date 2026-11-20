@@ -96,10 +96,20 @@ nothing); this module uppercases them.
 Failure posture: an unknown subject or GEP (both come back from the server as a
 silent empty result), a blank search, the server's bare `{}` refusal, a non-JSON
 or error response, a link list with no parseable courses, and network errors
-(including the connection the server drops ~30 s into a search that is too
-broad) all raise CourseCatalogError, never a silent empty list. A search that
-matches nothing returns [], which is a real answer. In get_courses() an unknown
-subject doesn't stop the batch: its codes come back in not_found.
+(including a search too broad for the server; see Timeouts) all raise
+CourseCatalogError, never a silent empty list. A search that matches nothing
+returns [], which is a real answer. In get_courses() an unknown subject doesn't
+stop the batch: its codes come back in not_found. An unknown subject's error
+names close matches ("EMG" -> did you mean EM?).
+
+Timeouts (2026-11-20): each network read waits up to DEFAULT_TIMEOUT (10 s). Real
+searches answer in under 3 s ("systems", 869 courses, took 2.8 s). Timeouts,
+dropped connections and 5xx errors are retried twice, so a server that stops
+answering fails in about 32 s (92 s at the old 30 s default); a host name that
+doesn't resolve fails at once. A search too broad for the server ("design",
+"students") gets its reply headers after ~5 s and then nothing until the server
+drops it ~10 s in. That stall after the headers is NOT retried, since a retry
+re-runs the same doomed search: it raises at once, saying to narrow the search.
 
 Speed: the server's think time dominates (~0.33 s a request plus ~2.7 ms a course;
 measured 2026-10-07), so lookups across several subjects fetch them concurrently,
@@ -127,10 +137,12 @@ Stdlib only (no third-party dependencies). Read-only network POSTs; writes nothi
 
 import argparse
 import csv
+import difflib
 import html
 import http.client
 import json
 import re
+import socket
 import ssl
 import sys
 import textwrap
@@ -148,6 +160,8 @@ USER_AGENT = "Mozilla/5.0 (course_catalog.py; NC State internal catalog query)"
 # Most requests in flight at once. It's a university production server, and it
 # slowed each request by only ~15-20% with three in flight (2026-10-07).
 MAX_PARALLEL = 4
+# Seconds to wait on each network read (see Timeouts in the module docstring).
+DEFAULT_TIMEOUT = 10
 
 # Copied from class_search.py (each tool here is one stdlib-only file, so they
 # copy shared code rather than import it), so keep the two in sync.
@@ -174,7 +188,35 @@ class CourseCatalogError(RuntimeError):
 
 class UnknownCodeError(CourseCatalogError):
     """An unknown subject or GEP code. get_courses() reports these in not_found
-    instead of stopping the whole batch."""
+    instead of stopping the whole batch. `suggestions` holds close matches."""
+
+    def __init__(self, message, suggestions=()):
+        super().__init__(message)
+        self.suggestions = list(suggestions)
+
+
+def _close_matches(value, known):
+    """Up to three known codes that look like a mistyped `value` (EMG -> EM)."""
+    return difflib.get_close_matches(value, sorted(known), n=3, cutoff=0.5)
+
+
+def _did_you_mean(close):
+    return f" (did you mean {' or '.join(close)}?)" if close else ""
+
+
+def _long_number_error(tok):
+    """A ValueError for a course number of 4+ digits (EMGT 5170), else None.
+
+    Other schools number courses with 4 digits (UNC Charlotte's EMGT 5170), and
+    "can't read '5170'" didn't say why it was refused.
+    """
+    m = re.fullmatch(r"[A-Za-z]{0,5}([0-9]{4,})[A-Za-z]?", tok)
+    if not m:
+        return None
+    return ValueError(
+        f"{tok!r}: NC State course numbers have 3 digits (NE 504); {m.group(1)} looks "
+        "like another school's numbering (UNC Charlotte's have 4). This tool covers "
+        "NC State only.")
 
 
 # ---------------------------------------------------------------------------
@@ -200,17 +242,25 @@ def _opener():
         return _OPENER
 
 
-def _http(url, data, timeout=30, retries=2):
+def _is_timeout(e):
+    """True for a timeout, raw or wrapped in URLError (socket.timeout is only an
+    alias of TimeoutError from Python 3.10)."""
+    return isinstance(e, (TimeoutError, socket.timeout)) or \
+        isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout))
+
+
+def _http(url, data, timeout=DEFAULT_TIMEOUT, retries=2):
     """POST `data` (dict) and return the decoded body text.
 
     Adapted from class_search.py's _http, which this file copies rather than
     imports (see CAREER_CODES). This copy adds the shared SSL context, and
-    doesn't retry a dropped connection (below); class_search.py retries one like
-    any other transient error.
+    doesn't retry a reply that stalls or drops after its headers (below);
+    class_search.py retries one like any other transient error.
 
     Transient failures (connect/read timeouts, connection errors, HTTP 5xx) are
-    retried up to `retries` times with a short backoff (0.5s, 1.5s). Other HTTP
-    errors raise immediately, with the response body (truncated) for diagnosis.
+    retried up to `retries` times with a short backoff (0.5s, 1.5s). A host name
+    that doesn't resolve isn't: a retry can't fix it. Other HTTP errors raise
+    immediately, with the response body (truncated) for diagnosis.
     """
     body = urllib.parse.urlencode(data).encode()
     last = None
@@ -221,7 +271,21 @@ def _http(url, data, timeout=30, retries=2):
                                      headers={"User-Agent": USER_AGENT})
         try:
             with _opener().open(req, timeout=timeout) as resp:
-                return resp.read().decode("utf-8", "replace")
+                try:
+                    return resp.read().decode("utf-8", "replace")
+                except (http.client.IncompleteRead, TimeoutError, socket.timeout) as e:
+                    # The headers came, then the body stalled or the connection
+                    # dropped. The server does this to a search too broad for it
+                    # (a very common word): headers after ~5 s, dropped ~10 s in
+                    # (2026-11-20; ~30 s on 2026-10-07). Not retried: a retry
+                    # re-runs the same doomed search.
+                    got = (f"closed the connection after {len(e.partial)} bytes"
+                           if isinstance(e, http.client.IncompleteRead)
+                           else f"sent nothing for {timeout} s")
+                    raise CourseCatalogError(
+                        f"{url} accepted the search, then {got}. It does this to a "
+                        "search that is too broad (e.g. a very common word): narrow "
+                        "the search. If the server is just slow, raise --timeout.") from e
         except urllib.error.HTTPError as e:
             snippet = ""
             try:
@@ -232,19 +296,17 @@ def _http(url, data, timeout=30, retries=2):
             if e.code not in (500, 502, 503, 504):
                 raise CourseCatalogError(msg) from e
             last = CourseCatalogError(msg)
-        except http.client.IncompleteRead as e:
-            # The server answers 200 with chunked headers, then drops the connection
-            # ~30 s into a search that is too broad (a blank or very common
-            # keyword; 2026-10-07). Not retried: a retry re-runs the same 30 s query.
-            raise CourseCatalogError(
-                f"{url} closed the connection after {len(e.partial)} bytes -- it "
-                "does this about 30 s into a search that is too broad (e.g. a very "
-                "common word); narrow the search") from e
         except (urllib.error.URLError, TimeoutError, OSError,
                 http.client.HTTPException) as e:
-            # NB: a read-timeout mid-body raises TimeoutError, NOT URLError, and
-            # http.client's own errors are not OSErrors.
-            last = CourseCatalogError(f"request to {url} failed: {e!r}")
+            # NB: a timeout waiting for the reply raises TimeoutError, NOT
+            # URLError, and http.client's own errors are not OSErrors.
+            hint = (f" (no reply within {timeout} s, {retries + 1} tries: the server "
+                    "may be busy; try again, or raise --timeout)" if _is_timeout(e) else "")
+            last = CourseCatalogError(f"request to {url} failed: {e!r}{hint}")
+            if isinstance(getattr(e, "reason", None), socket.gaierror):
+                # The host name didn't resolve (offline, or DNS/VPN trouble). A
+                # retry can't fix that, and it cost 2 s (2026-11-20).
+                raise last from e
     raise last
 
 
@@ -442,7 +504,7 @@ def _number_test(number, inequality):
     for t in parts:
         m = NUMBER_SPEC_RE.match(t.upper())
         if not m:
-            raise ValueError(
+            raise _long_number_error(t) or ValueError(
                 "course number must be 3 digits with an optional letter (504, 295A) "
                 f"or a range (500-599), got {t!r}")
         lo, hi = m.group(1), m.group(2)
@@ -467,7 +529,7 @@ def _number_test(number, inequality):
 # Public API
 # ---------------------------------------------------------------------------
 
-def list_subjects(timeout=30):
+def list_subjects(timeout=DEFAULT_TIMEOUT):
     """Return [{'code','name'}] for every subject in the catalog (subjects.php)."""
     subs = _subjects_payload(timeout).get("subj_js")
     try:
@@ -484,7 +546,7 @@ def list_subjects(timeout=30):
     return out
 
 
-def list_geps(timeout=30):
+def list_geps(timeout=DEFAULT_TIMEOUT):
     """Return [{'code','name'}] for the GEP categories the gep= search accepts."""
     out = [{"code": v, "name": html.unescape(t).strip()}
            for v, t in re.findall(r'<option[^>]*value="([^"]+)"[^>]*>([^<]*)</option>',
@@ -495,7 +557,7 @@ def list_geps(timeout=30):
 
 
 def search_catalog(subject=None, *, keyword=None, gep=None, match_any=False,
-                   career=None, number=None, inequality="=", timeout=30):
+                   career=None, number=None, inequality="=", timeout=DEFAULT_TIMEOUT):
     """Search the Course Catalog and return a list of course dicts.
 
     Exactly one of:
@@ -517,7 +579,7 @@ def search_catalog(subject=None, *, keyword=None, gep=None, match_any=False,
     value = re.sub(r"\s+", " ", str(raw_value)).strip()
     if not value:
         # A blank search makes the server scan everything and drop the connection
-        # after ~30 s; the registrar's own page refuses it too.
+        # (~10 to 30 s in; see Timeouts); the registrar's own page refuses it too.
         raise ValueError(f"{kind} is blank")
     test = _number_test(number, inequality)
 
@@ -567,13 +629,19 @@ def search_catalog(subject=None, *, keyword=None, gep=None, match_any=False,
     # An unknown subject or GEP comes back as a clean "no results", which reads
     # exactly like a real empty answer -- so check the code before believing it.
     if not everything and kind == "subject":
-        if value not in {s["code"] for s in list_subjects(timeout=timeout)}:
+        known = {s["code"] for s in list_subjects(timeout=timeout)}
+        if value not in known:
+            close = _close_matches(value, known)
             raise UnknownCodeError(
-                f"subject {value!r} is not in the Course Catalog -- unknown or mistyped")
+                f"subject {value!r} is not in the Course Catalog -- unknown or mistyped"
+                + _did_you_mean(close), suggestions=close)
     if not everything and kind == "gep":
-        if value not in {g["code"] for g in list_geps(timeout=timeout)}:
+        known = {g["code"] for g in list_geps(timeout=timeout)}
+        if value not in known:
+            close = _close_matches(value, known)
             raise UnknownCodeError(
-                f"GEP {value!r} is not a GEP category; see --list-geps")
+                f"GEP {value!r} is not a GEP category; see --list-geps"
+                + _did_you_mean(close), suggestions=close)
     return [c for c in courses if test(c["number"])] if test else courses
 
 
@@ -583,7 +651,7 @@ def parse_course_code(code):
     return (m.group(1).upper(), m.group(2).upper()) if m else None
 
 
-def get_courses(codes, timeout=30):
+def get_courses(codes, timeout=DEFAULT_TIMEOUT):
     """Look up specific courses, e.g. ["NE 504", "MAE 308"].
 
     Returns (courses, not_found): the courses in the order asked (duplicates
@@ -596,15 +664,16 @@ def get_courses(codes, timeout=30):
     for code in codes:
         pc = parse_course_code(code)
         if not pc:
-            raise ValueError(f"not a course code: {code!r} (expected e.g. 'NE 504')")
+            raise _long_number_error(re.sub(r"[\s\-]+", "", str(code))) or ValueError(
+                f"not a course code: {code!r} (expected e.g. 'NE 504')")
         parsed.append(pc)
     subjects = list(dict.fromkeys(s for s, _ in parsed))
 
     def fetch(subj):
         try:
             return {c["number"].upper(): c for c in search_catalog(subj, timeout=timeout)}
-        except UnknownCodeError:
-            return None
+        except UnknownCodeError as e:
+            return e
 
     by_subject = dict(zip(subjects, _parallel(fetch, subjects)))
     found, not_found, seen = [], [], set()
@@ -614,8 +683,9 @@ def get_courses(codes, timeout=30):
             continue
         seen.add(code)
         table = by_subject[subj]
-        if table is None:
-            not_found.append({"code": code, "reason": f"unknown subject {subj}"})
+        if isinstance(table, UnknownCodeError):
+            not_found.append({"code": code, "reason": f"unknown subject {subj}"
+                                                      + _did_you_mean(table.suggestions)})
         elif num in table:
             found.append(table[num])
         else:
@@ -683,7 +753,8 @@ def _parse_query(args):
             codes.append(f"{subject} {tok.upper()}")
             numbered = True
         else:
-            raise ValueError(f"can't read {tok!r} as a subject or a course code")
+            raise _long_number_error(tok) or ValueError(
+                f"can't read {tok!r} as a subject or a course code (e.g. NE or NE 504)")
     if not numbered:
         browse.append(subject)
     return codes, browse
@@ -708,8 +779,9 @@ def _other_numbers(course):
 
 def _fmt_not_found(item):
     if item["reason"].startswith("unknown subject"):
+        hint = re.search(r"\(did you mean [^)]*\)", item["reason"])
         return (f"{item['code']}  -- UNKNOWN SUBJECT {item['code'].split()[0]} "
-                "(mistyped?)")
+                + (hint.group(0) if hint else "(mistyped?)"))
     return f"{item['code']}  -- NOT IN THE COURSE CATALOG (no longer offered, or mistyped)"
 
 
@@ -797,8 +869,8 @@ def main(argv=None):
                     help="print every subject code and exit")
     ap.add_argument("--list-geps", action="store_true",
                     help="print the GEP category codes and exit")
-    ap.add_argument("--timeout", type=int, default=30,
-                    help="seconds to wait for each request (default 30)")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                    help=f"seconds to wait for each server reply (default {DEFAULT_TIMEOUT})")
     args = ap.parse_args(argv)
     if args.timeout <= 0:
         ap.error("--timeout must be a positive number of seconds")

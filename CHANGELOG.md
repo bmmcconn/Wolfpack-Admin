@@ -12,6 +12,76 @@ Dates below are when a change was published to this repo.
 
 ---
 
+## 2026-11-20
+
+### Fixed
+
+- **`class_search.py` — unpublished terms read as the schedule.** Class Search
+  answers for terms its own term list doesn't offer yet. In November 2026 the
+  following Fall returned a full slate of courses with 0 enrolled: the
+  registrar's draft. Nothing in the response marks it as a draft. The tool now
+  checks each term against the published list (alongside the search, so no
+  extra wait). For a term that isn't on it, the tool warns, marks the output
+  `!! UNPUBLISHED TERM`, and sets `term_published` to false in `--json` and
+  `--csv`. If you saved a pull of a term before it appeared in `--list-terms`,
+  treat it as a draft.
+- **`class_search.py` and `course_catalog.py` — a stalled server could hold a
+  call for about 90 seconds.**
+  Each reply was allowed 30 s, with two retries. Real queries answer in under
+  3 s, so the default is now 10 s (`--timeout` still overrides it), and a
+  stalled server fails in about 30 s. A host name that doesn't resolve now fails
+  at once instead of being retried. `class_search.py` rejects `--timeout 0`.
+- **`course_catalog.py` — a too-broad keyword search** (a very common word)
+  stalls after the server accepts it, and is dropped about 10 s in. It now fails
+  once, with a message to narrow the search, instead of timing out and retrying.
+- **`postgrad_outcomes.py` — a new column on the site would have shifted the
+  numbers.** Values were read by position, so a column the site inserted would
+  move every later value without a warning (tested: one inserted before the
+  average salary made a program's average read "$7" and its median show the
+  average). Columns are now read by their header names: an added column is
+  ignored and named in a note, and a missing or renamed one fails that program.
+  The site hasn't changed its columns, so no earlier output is affected; this
+  guards the next change.
+- **`postgrad_outcomes.py` — a failed program was dropped quietly.** If one
+  program's request failed, it was left out of the output and the run still
+  exited 0, so a partial `--csv` looked complete. Failed programs are now named
+  at the end, the run exits 1, and `--json` includes them with `"data": null`
+  and an `"error"`.
+- **`postgrad_outcomes.py` — an error from the job-title endpoint read as "no
+  employment responses reported."** It now fails that program instead. A
+  program with no rows still answers `[]` and still prints "none reported".
+- **`postgrad_outcomes.py` — a job title with a character outside Windows'
+  default code page crashed output sent to a file or pipe.** Output is now
+  UTF-8. `--csv` begins with a UTF-8 byte-order mark so Excel shows dashes and
+  accented characters correctly; in Python, read it with
+  `encoding="utf-8-sig"`.
+- **`postgrad_outcomes.py` — 45 s per request, no retries.** Each reply now gets
+  10 s (`--timeout` overrides it), with two retries for timeouts and server
+  errors. If two programs in a row fail on network errors, the run stops and
+  names the programs it didn't try, instead of spending about 30 s on each one
+  left.
+
+### Added
+
+- **`class_search.py` — several subjects, course codes and terms in one call**,
+  run concurrently (at most four at a time): `EM 501`, `"EM 501, ISE 543" EGR`,
+  `--term "Fall 2026, Spring 2027"`. A subject or course with no sections in a
+  term is a note, not an error, unless nothing at all was found. With more than
+  one term, `--json` returns `{"pulled_at", "terms": [...]}`; with one term it
+  keeps its old shape and adds `term_published` and `notes`.
+- **`class_search.py --with-crosslists`** fetches each cross-listed course's
+  other listings in the same term and gives whole-class totals: a "whole class"
+  line in the text output, one row per class in `--summary`, and `class_total`
+  in `--json`. Without it, `--summary` now says how many rows count only one
+  listing.
+- **`--csv` gains two columns at the end** (`crosslist_of`, `term_published`);
+  earlier columns are unchanged.
+- **`class_search.py` and `course_catalog.py` — clearer errors.** A four-digit course number (another school's
+  numbering) says so. An unknown subject names close matches ("EMG" → EM).
+  `class_search.py` accepts five-letter subjects, as `course_catalog.py` does.
+
+---
+
 ## 2026-10-08
 
 ### Fixed

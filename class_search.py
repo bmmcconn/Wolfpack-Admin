@@ -3,8 +3,9 @@
 
 Part of Wolfpack-Admin - https://github.com/bmmcconn/Wolfpack-Admin (MIT License).
 UNOFFICIAL: not an NC State product or service. Queries the same public Class
-Search endpoint that go.ncsu.edu/class_search uses; please be considerate - the
-tool sends one POST per query and retries only on 5xx server errors.
+Search endpoint that go.ncsu.edu/class_search uses; please be considerate - a
+query sends one POST per subject and term (at most 4 at once) plus one GET of
+the term list, and retries only on network errors and 5xx server errors.
 
 Class Search (go.ncsu.edu/class_search) is the TERM-SPECIFIC schedule tool: it
 lists the actual sections offered in a given term with live enrollment counts,
@@ -23,14 +24,27 @@ enrolled). e.g. "Open 33/60" = 33 seats open of 60 (so 27 enrolled); "Closed 0/5
 are LIVE and move daily until the term settles.
 
 Public API:
-    search_classes(term, subject, ...) -> list[course dict]   # main entry point
+    search_classes(term, subject, ...) -> list[course dict]   # one term, one subject
+    search_terms(terms, subjects, ...) -> one result per term # several of each, run
+        # concurrently; course codes; cross-listed partners (with_crosslists=True)
+    term_status(term) -> (published, message)  # is it on the published term list? (live)
     resolve_term(term) -> "2268"          # "Fall 2026" | "2026 fall" | 2268 -> strm
     build_term_code(year, season) -> "2268"
     default_term() -> "2271"              # the term Class Search opens on (live)
     list_terms() -> [{"code","label","default"}]   # scrapes the term dropdown (live)
     list_subjects(term) -> [{"code","name"}]
+    crosslist_families(courses) -> [[course, ...]]  # the listings of one class, grouped
     flatten_sections(courses, term, pulled) -> flat dicts, one per section (CSV)
     summarize_by_mode(courses) -> per-course on-campus vs online Enr/Cap rollup
+
+⚠️ UNPUBLISHED TERMS. The server answers for terms its dropdown doesn't offer.
+On 2026-11-20, Fall 2027 (2278), absent from the list, returned eight EM courses
+with 425 seats and 0 enrolled: the registrar's draft, apparently rolled forward
+from a year earlier. Nothing in the response marks it as a draft, so the term
+list is the only signal. search_classes() checks it (term_status(), alongside the
+search, so it adds no wait; index.php is fetched once per process) and issues an
+UnpublishedTermWarning when the term is missing. The CLI prints a warning, marks
+the text and --summary output, and fills `term_published` in --json and --csv.
 
 With no term, the CLI uses default_term(): the term the site's dropdown selects
 (2027 Spring on 2026-10-07), NOT the first one listed -- the dropdown puts the
@@ -110,11 +124,31 @@ ISE 538 compliant, so check every prefix a course carries (see `also_listed_as`)
 Failure posture: unknown subjects, unparseable results markup, bad subject-list
 responses and network errors all raise ClassSearchError (never a silent empty
 list); sections whose Avail. cell can't be parsed emit a warning and are
-excluded from course totals.
+excluded from course totals. A subject with no sections in a term raises
+NoSectionsError (a ClassSearchError), naming close matches when the subject
+isn't offered at all ("EMG" -> EM); search_terms() turns it into a note so
+one miss doesn't sink a batch.
+
+Timeouts (2026-11-20): each network read waits up to DEFAULT_TIMEOUT (10 s).
+Real queries answer in under 2 s (ECE Spring 2027, 93 courses, took 1.8 s).
+Timeouts, connection errors and 5xx errors are retried twice, so a server that
+stops answering fails in about 32 s (92 s at the old 30 s default); a host name
+that doesn't resolve fails at once.
+
+Cross-listed classes: each listing (EM 534, ISE 534) is a SEPARATE class with
+its own sections, seats and enrollment, so a one-subject pull counts only that
+prefix's students. search_terms(with_crosslists=True) (CLI --with-crosslists)
+also fetches every other listing in the same term; --summary then gives one row
+per class with whole-class totals. A class's capacity is the sum of its
+listings' own seat caps.
 
 CLI (output is BY COURSE, Avail/Cap + Enrolled per section):
     class_search.py EM                        # the term Class Search opens on
     class_search.py EM --term "Fall 2026"
+    class_search.py EM 501 --term 2271        # one course (EM501, EM-501 work too)
+    class_search.py "EM 501, ISE 543" EGR --term 2271   # codes and whole subjects mix
+    class_search.py EM ISE OR --term "Fall 2026, Spring 2027"   # run concurrently
+    class_search.py EM --term 2268 --summary --with-crosslists  # whole-class totals
     class_search.py EM --term 2268 --open-only
     class_search.py MAE --term 2268 --mode online
     class_search.py ISE --term 2268 --distance-ed             # all DE-coded sections
@@ -131,13 +165,17 @@ Stdlib only (no third-party dependencies). Read-only network GET/POST; writes no
 
 import argparse
 import csv
+import difflib
 import errno
 import html
 import http.client
 import json
 import os
 import re
+import socket
+import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -150,6 +188,11 @@ SEARCH_URL = f"{BASE}/search.php"
 INDEX_URL = f"{BASE}/index.php"
 SUBJECTS_URL = f"{BASE}/subjects.php"
 USER_AGENT = "Mozilla/5.0 (class_search.py; NC State internal schedule query)"
+# Seconds to wait on each network read (see Timeouts in the module docstring).
+DEFAULT_TIMEOUT = 10
+# Most requests in flight at once, as in course_catalog.py: it's a university
+# production server, and three in flight slowed each request by only ~15-20%.
+MAX_PARALLEL = 4
 
 # NC State term (strm) code = "2" + two-digit year + season digit.
 SEASON_DIGITS = {
@@ -184,6 +227,20 @@ RESERVE_RE = re.compile(r"(\d+)\s+seats?\s*-\s*(.*)", re.S)
 
 class ClassSearchError(RuntimeError):
     """Raised when the Class Search endpoint returns an error or bad response."""
+
+
+class NoSectionsError(ClassSearchError):
+    """A subject has no sections in a term (or the term has none at all).
+    search_terms() reports these as notes instead of stopping the batch."""
+
+
+class UnpublishedTermWarning(UserWarning):
+    """The term isn't on Class Search's published term list (`published` False),
+    or the list couldn't be fetched to check (`published` None)."""
+
+    def __init__(self, message, published=False):
+        super().__init__(message)
+        self.published = published
 
 
 # ---------------------------------------------------------------------------
@@ -271,12 +328,60 @@ def term_label(strm):
 # HTTP
 # ---------------------------------------------------------------------------
 
-def _http(url, data=None, timeout=30, retries=2):
+_OPENER = None
+_OPENER_LOCK = threading.Lock()
+
+
+def _opener():
+    """One urllib opener, with ONE SSL context, shared by every request (copied
+    from course_catalog.py: threads that each build a context wait on one another)."""
+    global _OPENER
+    with _OPENER_LOCK:
+        if _OPENER is None:
+            _OPENER = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        return _OPENER
+
+
+def _parallel(fn, items):
+    """fn(item) for each item, at most MAX_PARALLEL at once; results in input order.
+
+    Exceptions propagate as from a plain loop: the first failure in input order.
+    (Copied from course_catalog.py.)
+    """
+    items = list(items)
+    if len(items) < 2:
+        return [fn(x) for x in items]
+    from concurrent.futures import ThreadPoolExecutor  # ~5 ms; only when needed
+    _opener()  # build the shared SSL context before the threads race to build it
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(items))) as ex:
+        return list(ex.map(fn, items))
+
+
+def _in_background(fn, *args):
+    """Start fn(*args) on a worker thread; return a function that waits for and
+    returns its result (or raises its exception)."""
+    from concurrent.futures import ThreadPoolExecutor
+    ex = ThreadPoolExecutor(max_workers=1)
+    future = ex.submit(fn, *args)
+    ex.shutdown(wait=False)
+    return future.result
+
+
+def _is_timeout(e):
+    """True for a timeout, raw or wrapped in URLError (socket.timeout is only an
+    alias of TimeoutError from Python 3.10)."""
+    return isinstance(e, (TimeoutError, socket.timeout)) or \
+        isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout))
+
+
+def _http(url, data=None, timeout=DEFAULT_TIMEOUT, retries=2):
     """GET (data=None) or POST (data=dict) and return the decoded body text.
 
     Transient failures (connect/read timeouts, connection errors, HTTP 5xx) are
-    retried up to `retries` times with a short backoff (0.5s, 1.5s). Other HTTP
-    errors raise immediately, with the response body (truncated) for diagnosis.
+    retried up to `retries` times with a short backoff (0.5s, 1.5s). A host name
+    that doesn't resolve isn't: a retry can't fix it. Other HTTP errors raise
+    immediately, with the response body (truncated) for diagnosis.
     """
     body = urllib.parse.urlencode(data).encode() if data is not None else None
     last = None
@@ -286,7 +391,7 @@ def _http(url, data=None, timeout=30, retries=2):
         req = urllib.request.Request(url, data=body,
                                      headers={"User-Agent": USER_AGENT})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _opener().open(req, timeout=timeout) as resp:
                 return resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             snippet = ""
@@ -303,7 +408,13 @@ def _http(url, data=None, timeout=30, retries=2):
             # NB: a read-timeout mid-body raises TimeoutError, NOT URLError, and
             # http.client's own errors are not OSErrors: a connection dropped
             # mid-body (IncompleteRead) escaped as a traceback until 2026-10-07.
-            last = ClassSearchError(f"request to {url} failed: {e}")
+            hint = (f" (no reply within {timeout} s, {retries + 1} tries: the server "
+                    "may be busy; try again, or raise --timeout)" if _is_timeout(e) else "")
+            last = ClassSearchError(f"request to {url} failed: {e}{hint}")
+            if isinstance(getattr(e, "reason", None), socket.gaierror):
+                # The host name didn't resolve (offline, or DNS/VPN trouble). A
+                # retry can't fix that, and it cost 2 s (2026-11-20).
+                raise last from e
     raise last
 
 
@@ -560,7 +671,7 @@ def _parse_results(html_str):
     blocks = re.split(r'<section class="course"', html_str)[1:]
     for block in blocks:
         head = re.search(
-            r"<h1>\s*([A-Z]{1,4})\s*(\d{2,3}[A-Z]?)\s*<small>([^<]*)</small>",
+            r"<h1>\s*([A-Z]{1,5})\s*(\d{2,3}[A-Z]?)\s*<small>([^<]*)</small>",
             block,
         )
         if not head:
@@ -647,13 +758,15 @@ def _filter_sections(courses, keep):
 def _check_query(subject, course_number=None, course_inequality="=", career=None):
     """Validate a query before any request -> (subject, number, career_code)."""
     subject = str(subject).strip().upper()
-    if not re.fullmatch(r"[A-Z]{1,4}", subject):
-        raise ValueError(f"subject must be 1-4 letters, got {subject!r}")
+    # Five letters, as in course_catalog.py: the registrar's subject list has a
+    # five-letter code (USDEI), though no sections for it so far.
+    if not re.fullmatch(r"[A-Z]{1,5}", subject):
+        raise ValueError(f"subject must be 1-5 letters, got {subject!r}")
     # The site's own form takes 3 digits and an optional letter (catalog.js);
     # anything else came back "No results" and printed as 0 courses, exit 0.
     number = "" if course_number is None else str(course_number).strip().upper()
     if number and not re.fullmatch(r"[0-9]{3}[A-Z]?", number):
-        raise ValueError(
+        raise _long_number_error(number) or ValueError(
             f"course number must be 3 digits, optionally with a letter (534, 295A), "
             f"got {course_number!r}")
     if course_inequality not in ("=", "<=", ">="):
@@ -671,7 +784,7 @@ def _check_query(subject, course_number=None, course_inequality="=", career=None
 def search_classes(term, subject, *, course_number=None, course_inequality="=",
                    career=None, session=None, start_time=None, end_time=None,
                    instructor=None, open_only=False, mode=None, distance_ed=None,
-                   timeout=30):
+                   timeout=DEFAULT_TIMEOUT, check_term=True):
     """Query Class Search and return a list of course dicts (see module docstring).
 
     term    : strm ("2268") or friendly ("Fall 2026").
@@ -682,10 +795,16 @@ def search_classes(term, subject, *, course_number=None, course_inequality="=",
     distance_ed : None (all) | True (DE-coded only) | False (on-campus-coded only).
     open_only : True -> only sections with seats available.
     course_number + course_inequality ("=", "<=", ">=") : filter by catalog number.
+    check_term : True -> issue an UnpublishedTermWarning if the term isn't on
+              Class Search's published term list (checked alongside the search).
+
+    Raises NoSectionsError when the subject has no sections in the term.
     """
     strm = resolve_term(term)
     subject, number, career_code = _check_query(
         subject, course_number, course_inequality, career)
+    # Check the term against the published list while the search runs.
+    status = _in_background(term_status, strm, timeout) if check_term else None
 
     params = {
         "term": strm,
@@ -744,18 +863,24 @@ def search_classes(term, subject, *, course_number=None, course_inequality="=",
         known = {s["code"] for s in list_subjects(strm, timeout=timeout)}
         if subject not in known:
             if not known:
-                raise ClassSearchError(
+                raise NoSectionsError(
                     f"Class Search lists no subjects for {term_label(strm)} ({strm}) "
                     "— that term isn't on the schedule (see --list-terms)")
-            raise ClassSearchError(
+            close = difflib.get_close_matches(subject, sorted(known), n=3, cutoff=0.5)
+            raise NoSectionsError(
                 f"no {subject} sections in {term_label(strm)} ({strm}) — wrong "
-                "term, or mistyped subject")
+                "term, or mistyped subject"
+                + (f" (close matches this term: {', '.join(close)})" if close else ""))
     if open_only and courses and not any(c["enrollment_published"] for c in courses):
         # The server ignores open-classes here (ISE Spring 2026 returned all 46
         # courses), and with no seat counts every section would be dropped.
         raise ClassSearchError(
             f"can't tell which sections have open seats: Class Search doesn't "
             f"publish seat counts for {term_label(strm)} ({strm}) once a term ends")
+    if status is not None:
+        published, message = status()
+        if published is not True:
+            warnings.warn(UnpublishedTermWarning(message, published), stacklevel=2)
     # --- Re-apply every filter the server treats as advisory (all verified
     # --- 2026-08-11 against Fall 2026; each returns extra rows server-side).
     if instructor:
@@ -797,19 +922,62 @@ def _parse_terms(body):
     return terms
 
 
-def list_terms(timeout=30):
+_INDEX = None
+_INDEX_LOCK = threading.Lock()
+
+
+def _index_page(timeout):
+    """index.php (the term dropdown), fetched once per process.
+
+    list_terms(), default_term() and term_status() all read it, term_status()
+    from a background thread, so the lock makes later callers wait and reuse it.
+    """
+    global _INDEX
+    with _INDEX_LOCK:
+        if _INDEX is None:
+            _INDEX = _http(INDEX_URL, timeout=timeout)
+        return _INDEX
+
+
+def list_terms(timeout=DEFAULT_TIMEOUT):
     """Scrape the term dropdown -> [{'code','label','default'}], newest first.
 
     `default` marks the term Class Search opens on (see default_term()).
     """
-    terms = _parse_terms(_http(INDEX_URL, timeout=timeout))
+    terms = _parse_terms(_index_page(timeout))
     if not terms:
         raise ClassSearchError(
             "no term list on index.php — Class Search markup may have changed")
     return terms
 
 
-def default_term(timeout=30):
+def term_status(term, timeout=DEFAULT_TIMEOUT):
+    """(published, message): is the term on Class Search's published term list?
+
+    published is True (listed; message ""), False (not listed: see UNPUBLISHED
+    TERMS in the module docstring) or None (the list couldn't be fetched). The
+    check is advisory, so a failed fetch never fails a search.
+    """
+    strm = resolve_term(term)
+    try:
+        codes = [t["code"] for t in list_terms(timeout=timeout)]
+    except ClassSearchError as e:
+        return None, (f"couldn't check that {term_label(strm)} ({strm}) is a published "
+                      f"term: {e}")
+    if strm in codes:
+        return True, ""
+    newest = max(codes, key=int)
+    if int(strm) > int(newest):
+        return False, (
+            f"{term_label(strm)} ({strm}) isn't on Class Search's published term list "
+            f"(the newest is {term_label(newest)}). Its sections are the registrar's "
+            "unpublished draft: courses, times, instructors and seats can all change "
+            "before it opens. Don't report them as the schedule.")
+    return False, (f"{term_label(strm)} ({strm}) isn't on Class Search's term list; "
+                   "treat its sections as unofficial.")
+
+
+def default_term(timeout=DEFAULT_TIMEOUT):
     """The strm Class Search opens on: the dropdown's selected term.
 
     Not the newest: the dropdown lists the coming summer terms first. On
@@ -817,7 +985,7 @@ def default_term(timeout=30):
     and taking the top entry sent bare queries to a term with almost no sections.
     Falls back to the page's hidden current_strm, which matched.
     """
-    body = _http(INDEX_URL, timeout=timeout)
+    body = _index_page(timeout)
     for t in _parse_terms(body):
         if t["default"]:
             return t["code"]
@@ -827,7 +995,7 @@ def default_term(timeout=30):
     raise ClassSearchError("could not find Class Search's default term; pass --term")
 
 
-def list_subjects(term, timeout=30):
+def list_subjects(term, timeout=DEFAULT_TIMEOUT):
     """Return [{'code','name'}] of subjects offered in a term (via subjects.php).
 
     An empty list means the site lists none for that term (true of a term not yet
@@ -846,10 +1014,198 @@ def list_subjects(term, timeout=30):
     out = []
     for it in items:
         s = it if isinstance(it, str) else (it.get("name") or it.get("value") or "")
-        m = re.match(r"\s*([A-Z]{1,4})\s*-\s*(.*)", s)
+        m = re.match(r"\s*([A-Z]{1,5})\s*-\s*(.*)", s)
         out.append({"code": m.group(1), "name": m.group(2).strip()} if m
                    else {"code": s.strip(), "name": ""})
     return out
+
+
+def _long_number_error(tok):
+    """A ValueError for a course number of 4+ digits (EMGT 5170), else None.
+
+    Other schools number courses with 4 digits (UNC Charlotte's EMGT 5170), and a
+    bare format error didn't say why it was refused. (As in course_catalog.py.)
+    """
+    m = re.fullmatch(r"[A-Za-z]{0,5}([0-9]{4,})[A-Za-z]?", str(tok))
+    if not m:
+        return None
+    return ValueError(
+        f"{tok!r}: NC State course numbers have 3 digits (EM 501); {m.group(1)} looks "
+        "like another school's numbering (UNC Charlotte's have 4). This tool covers "
+        "NC State only.")
+
+
+def _codes(also_listed_as):
+    """'MA 505, OR 505' -> ['MA 505', 'OR 505']."""
+    return [x.strip() for x in (also_listed_as or "").split(",") if x.strip()]
+
+
+def _code(course):
+    return f"{course['subject']} {course['number']}"
+
+
+# search_classes() keywords that search_terms() passes through.
+_FILTER_KEYS = ("course_number", "course_inequality", "career", "session",
+                "start_time", "end_time", "instructor", "open_only", "mode",
+                "distance_ed")
+
+
+def search_terms(terms, subjects, *, numbers=None, with_crosslists=False,
+                 timeout=DEFAULT_TIMEOUT, **filters):
+    """search_classes() for every term x subject, at most MAX_PARALLEL at once.
+
+    terms    : one or more terms, in any form resolve_term() takes.
+    subjects : one or more subject prefixes.
+    numbers  : optional {subject: [numbers]}: keep only those courses of that
+               subject (course codes: {"EM": ["501"]}); a subject not in it is
+               kept whole. Its subjects are added to `subjects` if missing.
+    with_crosslists : also fetch, in the same term, every other listing of each
+               cross-listed course found (EM 534 -> ISE 534). Each added course
+               carries `crosslist_of` ("EM 534") and sits right after the course
+               that named it; every course in a family of two or more listings
+               carries `class_total` {"listings", "enrolled", "capacity"}, the
+               whole class (None totals for a term that publishes no enrollment).
+    filters  : any other search_classes() keyword (course_number,
+               course_inequality, career, instructor, open_only, mode,
+               distance_ed, ...). Cross-listed partners get the same filters
+               except the course-number ones.
+
+    Returns one dict per term, in the order given (duplicates merged):
+        {"term", "term_label", "subjects", "courses", "notes", "published",
+         "published_note"}
+    `published` / `published_note` are term_status()'s answer. `notes` are
+    misses that don't stop the batch: a subject with no sections in the term, a
+    course code with none, a cross-listed partner not offered. Network and
+    markup errors still raise ClassSearchError.
+    """
+    unknown = sorted(set(filters) - set(_FILTER_KEYS))
+    if unknown:
+        raise TypeError(f"search_terms() got unexpected keyword(s): {', '.join(unknown)}")
+    strms = list(dict.fromkeys(resolve_term(t) for t in terms))
+    picks = {}
+    for subj, nums in (numbers or {}).items():
+        subj = _check_query(subj)[0]
+        picks[subj] = {_check_query(subj, n)[1] for n in nums} or None
+    subjects = list(dict.fromkeys([_check_query(s)[0] for s in subjects] + list(picks)))
+    if not strms or not subjects:
+        raise ValueError("give at least one term and one subject")
+    # Bad filters fail here, before any request (search_classes checks them again).
+    _check_query(subjects[0], filters.get("course_number"),
+                 filters.get("course_inequality", "="), filters.get("career"))
+    statuses = _in_background(lambda: [term_status(s, timeout) for s in strms])
+
+    def misses(codes, strm, kw):
+        """Notes for codes with no sections; `kw` = the caller's own filters."""
+        filtered = (kw.get("distance_ed") is False or
+                    any(kw.get(k) not in (None, False, "", "=") for k in _FILTER_KEYS))
+        return [f"{code}: no sections in {term_label(strm)} ({strm})"
+                + (" that match the filters" if filtered else "") for code in codes]
+
+    def fetch(job):
+        """(courses, notes) for one subject in one term, keeping `wanted` numbers."""
+        strm, subject, wanted, kw = job
+        ask = dict(kw)
+        if wanted and len(wanted) == 1 and not ask.get("course_number"):
+            ask.update(course_number=next(iter(wanted)), course_inequality="=")
+        try:
+            found = search_classes(strm, subject, check_term=False, timeout=timeout, **ask)
+        except NoSectionsError as e:
+            return [], [str(e)]
+        if not wanted:
+            return found, []
+        found = [c for c in found if c["subject"] == subject and c["number"] in wanted]
+        missing = sorted(set(wanted) - {c["number"] for c in found})
+        return found, misses([f"{subject} {n}" for n in missing], strm, kw)
+
+    results = [{"term": s, "term_label": term_label(s), "subjects": subjects,
+                "courses": [], "notes": []} for s in strms]
+    by_term = {r["term"]: r for r in results}
+    jobs = [(s, subj, picks.get(subj), filters) for s in strms for subj in subjects]
+    for (strm, *_), (found, notes) in zip(jobs, _parallel(fetch, jobs)):
+        by_term[strm]["courses"] += found
+        by_term[strm]["notes"] += notes
+
+    if with_crosslists:
+        # The course-number filters were about the subjects asked for.
+        pkw = {k: v for k, v in filters.items()
+               if k not in ("course_number", "course_inequality")}
+        pjobs, named_by = [], {}
+        for r in results:
+            have = {_code(c) for c in r["courses"]}
+            want = {}                       # subject -> {number: code that named it}
+            for c in r["courses"]:
+                for code in _codes(c["also_listed_as"]):
+                    subj, _, num = code.partition(" ")
+                    if code not in have and num:
+                        want.setdefault(subj, {}).setdefault(num, _code(c))
+            for subj, nums in want.items():
+                pjobs.append((r["term"], subj, set(nums), pkw))
+                named_by[(r["term"], subj)] = nums
+        partners = {s: [] for s in strms}
+        for (strm, subj, nums, _), (found, _) in zip(pjobs, _parallel(fetch, pjobs)):
+            of = named_by[(strm, subj)]
+            for c in found:
+                c["crosslist_of"] = of[c["number"]]
+            got = {c["number"] for c in found}
+            by_term[strm]["notes"] += misses(
+                [f"{subj} {n} (cross-listed with {of[n]})" for n in sorted(nums - got)],
+                strm, pkw)
+            partners[strm] += found
+        for r in results:
+            ordered = []
+            for c in r["courses"]:
+                ordered.append(c)
+                ordered += [p for p in partners[r["term"]] if p["crosslist_of"] == _code(c)]
+            r["courses"] = ordered
+            for family in crosslist_families(ordered):
+                if len(family) > 1:
+                    total = _class_total(family)
+                    for c in family:
+                        c["class_total"] = total
+
+    for r, (published, message) in zip(results, statuses()):
+        r["published"], r["published_note"] = published, message
+    return results
+
+
+def crosslist_families(courses):
+    """Group the courses that are listings of one class -> [[course, ...], ...].
+
+    Two courses are one class when either names the other in also_listed_as.
+    Families keep the order of their first member, and members keep the order
+    of `courses`; a course with no partner among `courses` is a family of one.
+    Only meaningful within one term.
+    """
+    parent = {}
+
+    def root(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    present = {_code(c) for c in courses}
+    for c in courses:
+        for other in _codes(c["also_listed_as"]):
+            if other in present:
+                a, b = root(_code(c)), root(other)
+                if a != b:
+                    parent[b] = a
+    groups = {}
+    for c in courses:
+        groups.setdefault(root(_code(c)), []).append(c)
+    return list(groups.values())
+
+
+def _class_total(family):
+    """{"listings", "enrolled", "capacity"} for the listings of one class."""
+    listings = [_code(c) for c in family]
+    if not all(c.get("enrollment_published", True) for c in family):
+        return {"listings": listings, "enrolled": None, "capacity": None}
+    return {"listings": listings,
+            "enrolled": sum(c["enrolled"] or 0 for c in family),
+            "capacity": sum(c["capacity"] or 0 for c in family)}
 
 
 CSV_FIELDS = [
@@ -861,6 +1217,10 @@ CSV_FIELDS = [
     # `requisites` is the course's; the `class_` columns are the section's.
     # (`description` is in --json only: it would repeat on every section row.)
     "requisites", "class_notes", "class_requisites", "seat_reserves",
+    # Added 2026-11-20, at the end for the same reason. `crosslist_of` is set on
+    # the partner courses --with-crosslists adds; `term_published` is False for
+    # a term not on Class Search's term list (a draft), blank when unchecked.
+    "crosslist_of", "term_published",
 ]
 
 
@@ -873,11 +1233,12 @@ def _reserves_text(reserves):
         for r in reserves)
 
 
-def flatten_sections(courses, term="", pulled=""):
+def flatten_sections(courses, term="", pulled="", term_published=""):
     """Flatten course dicts into one flat dict per section (course cols repeated).
 
     Column order = CSV_FIELDS. `term` and `pulled` (ISO date) stamp every row so
-    CSVs saved from different pulls can be concatenated and diffed over time.
+    CSVs saved from different pulls can be concatenated and diffed over time;
+    `term_published` (term_status()'s answer) marks a draft term's rows.
     """
     rows = []
     for c in courses:
@@ -889,11 +1250,13 @@ def flatten_sections(courses, term="", pulled=""):
                    "requisites": c.get("requisites", "")}
             row.update({k: s[k] for k in CSV_FIELDS if k in s})
             row["seat_reserves"] = _reserves_text(s.get("seat_reserves") or [])
+            row["crosslist_of"] = c.get("crosslist_of", "")
+            row["term_published"] = "" if term_published is None else term_published
             rows.append(row)
     return rows
 
 
-def summarize_by_mode(courses):
+def summarize_by_mode(courses, combine_crosslists=False):
     """Roll each course's sections up into on-campus vs distance-ed Enr/Cap totals.
 
     Splits on `distance_ed` (how the section is CODED), not `mode` (how it
@@ -903,7 +1266,7 @@ def summarize_by_mode(courses):
     reader, not for the `mode` field.
 
     Returns one dict per course:
-        {subject, number, title, also_listed_as, enrollment_published,
+        {subject, number, title, also_listed_as, listings, enrollment_published,
          campus_enrolled, campus_capacity, online_enrolled, online_capacity}
     A side's Enr/Cap is None when the course has NO such section (so the CLI can
     print "—"), versus 0/N when a section exists but is empty; both sides are
@@ -911,28 +1274,39 @@ def summarize_by_mode(courses):
     Sections with an unparseable Avail. cell are skipped, matching the
     course-total convention in _parse_results().
 
-    Caveat for cross-listed courses: each listing is a SEPARATE class, with its
-    own class number, capacity and enrollment, so a per-subject rollup counts
-    only the students enrolled under that prefix. The course's real size is the
-    sum across every code in `also_listed_as`: EM 534 showed 37 in Fall 2026 and
+    Cross-listed courses: each listing is a SEPARATE class, with its own class
+    number, capacity and enrollment, so a per-subject rollup counts only the
+    students enrolled under that prefix: EM 534 showed 37 in Fall 2026 and
     ISE 534 4 more, so the class was 41. (This docstring said the opposite, that
-    summing across subjects double-counts, until 2026-10-07.)
+    summing across subjects double-counts, until 2026-10-07.) With
+    combine_crosslists=True, the listings of one class among `courses` (see
+    crosslist_families(); fetch them with search_terms(with_crosslists=True))
+    become ONE row with whole-class totals: `listings` names them, and
+    `also_listed_as` then holds only the listings not among `courses`.
     """
+    groups = crosslist_families(courses) if combine_crosslists else [[c] for c in courses]
     rows = []
-    for c in courses:
+    for group in groups:
         agg = {"online": [0, 0, False], "in-person": [0, 0, False]}
-        for s in c["sections"]:
-            if s["enrolled"] is None:
-                continue
-            bucket = agg["online"] if s["distance_ed"] else agg["in-person"]
-            bucket[0] += s["enrolled"]
-            bucket[1] += s["capacity"]
-            bucket[2] = True
+        for c in group:
+            for s in c["sections"]:
+                if s["enrolled"] is None:
+                    continue
+                bucket = agg["online"] if s["distance_ed"] else agg["in-person"]
+                bucket[0] += s["enrolled"]
+                bucket[1] += s["capacity"]
+                bucket[2] = True
         cam, onl = agg["in-person"], agg["online"]
+        first, listings = group[0], [_code(c) for c in group]
+        also = first["also_listed_as"]
+        if combine_crosslists:
+            also = ", ".join(dict.fromkeys(
+                x for c in group for x in _codes(c["also_listed_as"]) if x not in listings))
         rows.append({
-            "subject": c["subject"], "number": c["number"], "title": c["title"],
-            "also_listed_as": c["also_listed_as"],
-            "enrollment_published": c.get("enrollment_published", True),
+            "subject": first["subject"], "number": first["number"], "title": first["title"],
+            "also_listed_as": also,
+            "listings": listings,
+            "enrollment_published": all(c.get("enrollment_published", True) for c in group),
             "campus_enrolled": cam[0] if cam[2] else None,
             "campus_capacity": cam[1] if cam[2] else None,
             "online_enrolled": onl[0] if onl[2] else None,
@@ -945,6 +1319,56 @@ def summarize_by_mode(courses):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _parse_query(tokens):
+    """Read the positional arguments -> {subject: set of numbers, or None = whole}.
+
+    Tokens split on spaces, commas, semicolons and hyphens, so all of these work:
+    EM · EM ISE OR · EM 501 · EM501 · EM-501 · "EM 501, ISE 543" · EM 501 534 ISE.
+    A subject's numbers follow it; a subject with none after it is taken whole,
+    which wins if the same subject is also named with numbers. Order is kept.
+    (The grammar is course_catalog.py's.)
+    """
+    picks, subject, numbered = {}, None, True
+
+    def take(subj, num):
+        if picks.get(subj, ()) is not None:     # a whole subject stays whole
+            picks.setdefault(subj, set()).add(num)
+
+    for tok in (t for a in tokens for t in re.split(r"[\s,;\-]+", a) if t):
+        glued = re.fullmatch(r"([A-Za-z]{1,5})([0-9]{3}[A-Za-z]?)", tok)
+        if glued:                                       # EM501
+            if not numbered:
+                picks[subject] = None
+            subject, numbered = glued.group(1).upper(), True
+            take(subject, glued.group(2).upper())
+        elif re.fullmatch(r"[A-Za-z]{1,5}", tok):       # EM
+            if not numbered:
+                picks[subject] = None
+            subject, numbered = tok.upper(), False
+        elif re.fullmatch(r"[0-9]{3}[A-Za-z]?", tok):   # 501, after a subject
+            if subject is None:
+                raise ValueError(f"course number {tok} has no subject before it "
+                                 "(e.g. EM 501)")
+            take(subject, tok.upper())
+            numbered = True
+        else:
+            raise _long_number_error(tok) or ValueError(
+                f"can't read {tok!r} as a subject or a course code (e.g. EM or EM 501)")
+    if not numbered:
+        picks[subject] = None
+    return picks
+
+
+def _flag(published):
+    """The header line for a term that isn't (or couldn't be confirmed) published."""
+    if published is False:
+        return ("!! UNPUBLISHED TERM: not on Class Search's term list. A draft "
+                "schedule: anything can change before it opens.")
+    if published is None:
+        return "!! Couldn't confirm this term is published (the term list didn't load)."
+    return ""
+
+
 def _when(s):
     """'Tu/Th 7:30 PM - 8:45 PM; M 6:00 PM - 8:45 PM' from the aligned days/time."""
     days, times = s["days"].split("; "), s["time"].split("; ")
@@ -954,16 +1378,19 @@ def _when(s):
                      for d, t in zip(days, times))
 
 
-def _fmt_courses(courses, strm):
+def _fmt_courses(courses, strm, flag="", notes=()):
     syl_shown = any(s["syllabus"] is not None for c in courses for s in c["sections"])
-    lines = [f"NC State Class Search — {term_label(strm)} ({strm})",
-             f"Pulled {date.today().isoformat()}  ·  Avail = seats available / "
-             f"capacity; Enr = enrolled (capacity - available)",
-             "SYL = published syllabus in Class Search; NO-SYL = none published"
-             if syl_shown or not courses else
-             "Syllabi: Class Search shows none for this term (only while one is in session)",
-             ""]
-    tot_a = tot_c = tot_e = tot_s = tot_syl = 0
+    lines = [f"NC State Class Search — {term_label(strm)} ({strm})"]
+    if flag:
+        lines.append(flag)
+    lines += [f"Pulled {date.today().isoformat()}  ·  Avail = seats available / "
+              f"capacity; Enr = enrolled (capacity - available)",
+              "SYL = published syllabus in Class Search; NO-SYL = none published"
+              if syl_shown or not courses else
+              "Syllabi: Class Search shows none for this term (only while one is in session)",
+              ""]
+    tail = [""] + [f"note: {n}" for n in notes] if notes else []
+    tot_a = tot_c = tot_e = tot_s = tot_syl = partners = 0
     for c in courses:
         alt = f"  (= {c['also_listed_as']})" if c["also_listed_as"] else ""
         u = f" · {c['units']} cr" if c["units"] else ""
@@ -973,7 +1400,16 @@ def _fmt_courses(courses, strm):
             roll = f"[Avail {c['capacity'] - c['enrolled']}/{c['capacity']} · Enr {c['enrolled']}]"
         else:
             roll = "[enrollment not published for this term]"
-        lines.append(f"{c['subject']} {c['number']}  {c['title']}{u}   {roll}{alt}")
+        tag = ""
+        if c.get("crosslist_of"):
+            partners += 1
+            tag = f"   [cross-listed partner of {c['crosslist_of']}]"
+        lines.append(f"{c['subject']} {c['number']}  {c['title']}{u}   {roll}{alt}{tag}")
+        total = c.get("class_total")
+        if total and total["listings"][0] == _code(c):
+            whole = (f"Enr {total['enrolled']} / Cap {total['capacity']}"
+                     if total["enrolled"] is not None else "enrollment not published")
+            lines.append(f"    whole class ({' + '.join(total['listings'])}): {whole}")
         for s in c["sections"]:
             tot_s += 1
             if s["seats_available"] is not None:
@@ -1001,7 +1437,7 @@ def _fmt_courses(courses, strm):
         lines.append("")
     if not courses:
         lines.append("0 courses · no sections match")
-        return "\n".join(lines)
+        return "\n".join(lines + tail)
     # Same reason as the per-course rollup: a 0/0 total for a term that publishes
     # no Avail. column would read as "nobody enrolled". Decided by the flag, not
     # by tot_c, which is also 0 when nothing matched in a term that does publish.
@@ -1010,13 +1446,17 @@ def _fmt_courses(courses, strm):
               else "enrollment not published for this term")
     syllabi = (f"Syllabi {tot_syl}/{tot_s}" if syl_shown
                else "syllabi not shown for this term")
-    lines.append(f"{len(courses)} courses · {tot_s} sections · {totals} · {syllabi}")
-    return "\n".join(lines)
+    incl = f" (incl. {partners} cross-listed partner(s))" if partners else ""
+    lines.append(f"{len(courses)} courses{incl} · {tot_s} sections · {totals} · {syllabi}")
+    return "\n".join(lines + tail)
 
 
-def _fmt_summary(courses, strm):
-    """Per-course table: on-campus vs online Enr/Cap (the 'by mode' rollup)."""
-    rows = summarize_by_mode(courses)
+def _fmt_summary(courses, strm, flag="", notes=(), combine=False):
+    """Per-course table: on-campus vs online Enr/Cap (the 'by mode' rollup).
+
+    combine=True gives one row per class, its cross-listed listings summed.
+    """
+    rows = summarize_by_mode(courses, combine_crosslists=combine)
     published = any(r["enrollment_published"] for r in rows)
 
     def ec(r, side):
@@ -1026,11 +1466,13 @@ def _fmt_summary(courses, strm):
         e, c = r[f"{side}_enrolled"], r[f"{side}_capacity"]
         return f"{e}/{c}" if e is not None else "—"
 
-    codes = [f"{r['subject']} {r['number']}" for r in rows]
+    codes = [" + ".join(r["listings"]) if combine else f"{r['subject']} {r['number']}"
+             for r in rows]
     titles = [r["title"] for r in rows]
     campus = [ec(r, "campus") for r in rows]
     online = [ec(r, "online") for r in rows]
     xlist = [r["also_listed_as"] or "—" for r in rows]
+    xhead = "Other listings" if combine else "Cross-listed"
 
     ce = sum(r["campus_enrolled"] or 0 for r in rows)
     cc = sum(r["campus_capacity"] or 0 for r in rows)
@@ -1042,27 +1484,40 @@ def _fmt_summary(courses, strm):
     wt = max([len("Title")] + [len(x) for x in titles])
     wca = max([len("On-campus"), len(campus_tot)] + [len(x) for x in campus])
     wo = max([len("Online"), len(online_tot)] + [len(x) for x in online])
-    wx = max([len("Cross-listed")] + [len(x) for x in xlist])
+    wx = max([len(xhead)] + [len(x) for x in xlist])
 
     def row(code, title, cap, onl, xl):
         return (f"{code:<{wc}}  {title:<{wt}}  {cap:>{wca}}  "
                 f"{onl:>{wo}}  {xl:<{wx}}").rstrip()
 
-    out = [f"NC State Class Search — {term_label(strm)} ({strm})",
-           f"Enrolled / Capacity by mode (seats filled, not seats open) · "
-           f"Pulled {date.today().isoformat()}", "",
-           row("Course", "Title", "On-campus", "Online", "Cross-listed"),
-           row("-" * wc, "-" * wt, "-" * wca, "-" * wo, "-" * wx)]
+    out = [f"NC State Class Search — {term_label(strm)} ({strm})"]
+    if flag:
+        out.append(flag)
+    out += [f"Enrolled / Capacity by mode (seats filled, not seats open) · "
+            f"Pulled {date.today().isoformat()}", "",
+            row("Course", "Title", "On-campus", "Online", xhead),
+            row("-" * wc, "-" * wt, "-" * wca, "-" * wo, "-" * wx)]
     for i, _ in enumerate(rows):
         out.append(row(codes[i], titles[i], campus[i], online[i], xlist[i]))
+    noun = "classes" if combine else "courses"
     # A 0/0 total for a closed term read as "nobody enrolled" (see _fmt_courses).
     if not rows:
         out += ["", "0 courses · no sections match"]
     elif not published:
-        out += ["", f"{len(rows)} courses · enrollment not published for this term"]
+        out += ["", f"{len(rows)} {noun} · enrollment not published for this term"]
     else:
         out.append(row("", "TOTAL", campus_tot, online_tot, ""))
-        out += ["", f"{len(rows)} courses · grand total {ce + oe}/{cc + oc}"]
+        out += ["", f"{len(rows)} {noun} · grand total {ce + oe}/{cc + oc}"]
+    if combine:
+        out.append("Cross-listed classes are combined: a row counts every listing "
+                   "offered this term (Other listings: not offered, or filtered out).")
+    else:
+        n = sum(1 for r in rows if r["also_listed_as"])
+        if n:
+            out.append(f"{n} cross-listed course(s) count only the listing shown; "
+                       "--with-crosslists adds the other listings for whole-class totals.")
+    if notes:
+        out += [""] + [f"note: {n}" for n in notes]
     return "\n".join(out)
 
 
@@ -1074,10 +1529,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Query NC State Class Search for section + enrollment data "
                     "(output grouped by course, Enr/Cap per section).")
-    ap.add_argument("subject", nargs="?", help="subject prefix, e.g. EM, MAE, ISE")
-    ap.add_argument("--term", help="strm (2268) or friendly ('Fall 2026'); "
-                    "default = the term Class Search opens on (see --list-terms)")
-    ap.add_argument("--number", help="course number filter (with --ineq)")
+    ap.add_argument("query", nargs="*", metavar="SUBJECT_OR_CODE",
+                    help="subjects (EM, or EM ISE OR) and/or course codes (EM 501, "
+                         "EM501, EM-501, 'EM 501, ISE 543')")
+    ap.add_argument("--term", action="append",
+                    help="strm (2268) or friendly ('Fall 2026'); several: comma-separated "
+                         "('Fall 2026, Spring 2027') or repeat --term. Default = the "
+                         "term Class Search opens on (see --list-terms)")
+    ap.add_argument("--number", help="course number filter for whole subjects (with --ineq)")
     ap.add_argument("--ineq", default="=", choices=["=", "<=", ">="],
                     help="course-number comparison (default '=')")
     ap.add_argument("--career", help="undergraduate | graduate | veterinary | agricultural")
@@ -1093,6 +1552,10 @@ def main(argv=None):
     ap.add_argument("--no-distance-ed", dest="distance_ed", action="store_false",
                     help="only on-campus-coded sections")
     ap.add_argument("--open-only", action="store_true", help="only sections with open seats")
+    ap.add_argument("--with-crosslists", action="store_true",
+                    help="also fetch each cross-listed course's other listings (EM 534 -> "
+                         "ISE 534) for whole-class enrollment; --summary then gives one "
+                         "row per class")
     fmt = ap.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="structured JSON output")
     fmt.add_argument("--csv", action="store_true",
@@ -1102,60 +1565,108 @@ def main(argv=None):
     ap.add_argument("--list-terms", action="store_true", help="print valid terms and exit")
     ap.add_argument("--list-subjects", action="store_true",
                     help="print subjects offered in --term and exit")
-    ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                    help=f"seconds to wait for each server reply (default {DEFAULT_TIMEOUT})")
     args = ap.parse_args(argv)
-    # Checked before any request (a missing subject used to cost one first).
-    if not (args.subject or args.list_terms or args.list_subjects):
-        ap.error("subject is required (e.g. EM) unless using --list-terms or "
-                 "--list-subjects")
+    # All checked before any request (a missing subject used to cost one first).
+    if args.timeout <= 0:
+        ap.error("--timeout must be a positive number of seconds")
+    if not (args.query or args.list_terms or args.list_subjects):
+        ap.error("give a subject (EM) or a course code (EM 501), unless using "
+                 "--list-terms or --list-subjects")
+    try:
+        picks = _parse_query(args.query)
+    except ValueError as e:
+        ap.error(str(e))
+    terms = [t.strip() for a in (args.term or []) for t in a.split(",") if t.strip()]
+    if args.number and any(picks.values()):
+        ap.error("--number applies to whole subjects; leave it out with course codes "
+                 "(EM 501)")
+    if args.list_subjects and len(terms) > 1:
+        ap.error("--list-subjects takes one --term")
 
-    listing = None
+    listing = results = None
     try:
         if args.list_terms:
             listing = [f"{t['code']}  {t['label']}" + ("  (default)" if t["default"] else "")
                        for t in list_terms(timeout=args.timeout)]
         else:
             if not args.list_subjects:
-                _check_query(args.subject, args.number, args.ineq, args.career)
-            if args.term:
-                strm = resolve_term(args.term)
+                for subj, nums in picks.items():
+                    _check_query(subj, args.number, args.ineq, args.career)
+                    for n in nums or ():
+                        _check_query(subj, n)
+            if terms:
+                strms = list(dict.fromkeys(resolve_term(t) for t in terms))
             else:
-                strm = default_term(timeout=args.timeout)
-                print(f"note: no --term; using {term_label(strm)} ({strm}), the term "
-                      "Class Search opens on", file=sys.stderr)
+                strms = [default_term(timeout=args.timeout)]
+                print(f"note: no --term; using {term_label(strms[0])} ({strms[0]}), the "
+                      "term Class Search opens on", file=sys.stderr)
             if args.list_subjects:
                 listing = [f"{s['code']:<5} {s['name']}"
-                           for s in list_subjects(strm, timeout=args.timeout)]
+                           for s in list_subjects(strms[0], timeout=args.timeout)]
             else:
-                courses = search_classes(
-                    strm, args.subject, course_number=args.number,
-                    course_inequality=args.ineq, career=args.career,
-                    instructor=args.instructor, mode=args.mode,
-                    distance_ed=args.distance_ed,
-                    open_only=args.open_only, timeout=args.timeout,
-                )
+                results = search_terms(
+                    strms, list(picks), numbers={s: n for s, n in picks.items() if n},
+                    with_crosslists=args.with_crosslists, timeout=args.timeout,
+                    course_number=args.number, course_inequality=args.ineq,
+                    career=args.career, instructor=args.instructor, mode=args.mode,
+                    distance_ed=args.distance_ed, open_only=args.open_only)
     except (ClassSearchError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+    if results is not None:
+        for r in results:
+            if r["published"] is not True:
+                print(f"warning: {r['published_note']}", file=sys.stderr)
+        # Nothing found anywhere, and something to say why (a mistyped subject,
+        # a course not offered): an error, as a single query has always been.
+        if not any(r["courses"] for r in results) and any(r["notes"] for r in results):
+            for r in results:
+                for n in r["notes"]:
+                    print(f"error: {n}", file=sys.stderr)
+            return 1
 
     try:
         if listing is not None:
             if listing:
                 print("\n".join(listing))
         elif args.json:
-            print(json.dumps({"term": strm, "term_label": term_label(strm),
-                              "subject": args.subject.upper(),
-                              "pulled_at": datetime.now().isoformat(timespec="seconds"),
-                              "courses": courses}, indent=2))
+            pulled_at = datetime.now().isoformat(timespec="seconds")
+            if len(results) == 1:
+                # The original single-term shape, so existing readers keep working.
+                r = results[0]
+                doc = {"term": r["term"], "term_label": r["term_label"],
+                       "subject": ", ".join(r["subjects"]), "pulled_at": pulled_at,
+                       "term_published": r["published"], "notes": r["notes"],
+                       "courses": r["courses"]}
+            else:
+                doc = {"pulled_at": pulled_at, "terms": [
+                    {"term": r["term"], "term_label": r["term_label"],
+                     "term_published": r["published"], "subjects": r["subjects"],
+                     "notes": r["notes"], "courses": r["courses"]} for r in results]}
+            print(json.dumps(doc, indent=2))
         elif args.csv:
+            for r in results:
+                for n in r["notes"]:
+                    print(f"note: {n}", file=sys.stderr)
             w = csv.DictWriter(sys.stdout, fieldnames=CSV_FIELDS, lineterminator="\n")
             w.writeheader()
-            w.writerows(flatten_sections(courses, term=strm,
-                                         pulled=date.today().isoformat()))
-        elif args.summary:
-            print(_fmt_summary(courses, strm))
+            for r in results:
+                w.writerows(flatten_sections(r["courses"], term=r["term"],
+                                             pulled=date.today().isoformat(),
+                                             term_published=r["published"]))
         else:
-            print(_fmt_courses(courses, strm))
+            blocks = []
+            for r in results:
+                if args.summary:
+                    blocks.append(_fmt_summary(r["courses"], r["term"], _flag(r["published"]),
+                                               r["notes"], combine=args.with_crosslists))
+                else:
+                    blocks.append(_fmt_courses(r["courses"], r["term"], _flag(r["published"]),
+                                               r["notes"]))
+            print("\n\n".join(blocks))
         sys.stdout.flush()
     except OSError as e:
         # The reader stopped early (`| head -1`, `| Select-Object -First 5`).
